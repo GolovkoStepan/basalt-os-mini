@@ -1,0 +1,41 @@
+# Конфиг clangd для проекта: ESP32-S3 / Xtensa, платформа espressif32@8.0.0.
+#
+# Файл лежит в репозитории проекта: у basalt-os (отдельный репозиторий) другой
+# тулчейн — riscv32, и его include-пути несовместимы с этими. clangd объединяет
+# конфиги из всех родительских каталогов, поэтому общий файл в корне лабы
+# добавлял бы чужие -isystem в каждый проект.
+#
+# Что чинится здесь (замерено `clangd --check` на pulsar/src/main.cpp — тот же
+# тулчейн и та же платформа, что здесь):
+#   без файла ...................... 4 ошибки
+#       три флага GCC, которых clang не знает, плюс 'stdbool.h' file not found
+#   с файлом ....................... 0 ошибок
+#
+# Отсюда две части и обе нужны:
+#   Remove — убрать флаги GCC, которые приходят из platformio.ini;
+#   Add    — дать newlib и libstdc++ тулчейна: сам clangd их не находит.
+#
+# Одного --query-driver из ~/.config/zed/settings.json недостаточно: с ним, но
+# без этого файла, ошибок становится 8 — GCC-ные заголовки конфликтуют с
+# заголовками clang и ломают перегрузки (println, printf).
+#
+# ВНИМАНИЕ: пути содержат версию GCC (14.2.0). После обновления espressif32
+# или тулчейна их нужно поправить. Проверить актуальную версию:
+#   ls ~/.platformio/packages/toolchain-xtensa-esp-elf/lib/gcc/xtensa-esp-elf/
+# Если clangd перестал видеть стандартные заголовки (<string>, <cstdint>) —
+# почти всегда причина именно в этом.
+#
+# После изменения platformio.ini (флаги, библиотеки) обновите базу проекта:
+#   pio run -t compiledb
+
+CompileFlags:
+  Remove:
+    - -mdisable-hardware-atomics
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+  Add:
+    - -isystem /Users/s.golovko/.platformio/packages/toolchain-xtensa-esp-elf/xtensa-esp-elf/include
+    - -isystem /Users/s.golovko/.platformio/packages/toolchain-xtensa-esp-elf/lib/gcc/xtensa-esp-elf/14.2.0/include
+    - -isystem /Users/s.golovko/.platformio/packages/toolchain-xtensa-esp-elf/xtensa-esp-elf/include/c++/14.2.0
+    - -isystem /Users/s.golovko/.platformio/packages/toolchain-xtensa-esp-elf/xtensa-esp-elf/include/c++/14.2.0/xtensa-esp-elf/esp32
+    - -isystem /Users/s.golovko/.platformio/packages/toolchain-xtensa-esp-elf/xtensa-esp-elf/include/c++/14.2.0/backward

@@ -1,0 +1,7 @@
+.pio/
+compile_commands.json
+.cache/
+logs/
+backup/
+__pycache__/
+.DS_Store
