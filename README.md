@@ -1,5 +1,7 @@
 # BASALT-OS-MINI
 
+[![сборка и тесты](https://github.com/GolovkoStepan/basalt-os-mini/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/GolovkoStepan/basalt-os-mini/actions/workflows/build.yml)
+
 Терминальная операционная система для **M5Stack Cardputer** (ESP32-S3).
 Без графического интерфейса: экран — текстовый терминал 40×15, ввод —
 физическая клавиатура.
