@@ -22,15 +22,18 @@
 basalt-os-mini/
 ├── AGENTS.md            этот файл
 ├── README.md            что за система и почему
+├── Makefile             короткие имена команд: make help
 ├── .clangd              пути xtensa-тулчейна
-├── platformio.ini       env'ы console, hello, bringup, bare, bare-panic
+├── platformio.ini       [base] для прошивок + env'ы console, hello, bringup, bare, bare-panic, native
 ├── ld/memory.ld         карта памяти приложения (своя, не из IDF)
+├── .github/workflows/   сборка всех env и тесты на хосте
 ├── docs/
 │   ├── board.md         железо Cardputer: пины, драйверы, грабли, замеры
 │   ├── FUNCTIONALITY.md что система умеет — источник истины по терминалу
 │   ├── JOURNAL.md       журнал: что сделано, зачем и как проверить
 │   └── ROADMAP.md       вехи A0–A12
-├── tools/               serial-read, flash-backup
+├── tools/               serial-read, flash-backup, check-image, smoke, reset
+├── test/                хостовые тесты (Unity), по каталогу на модуль
 ├── src/                 точки входа env'ов: bare, bringup, hello, console
 ├── arch/xtensa/         старт, векторы, паника, консоль, тик, светодиод
 └── include/
@@ -71,6 +74,40 @@ basalt-os-mini/
 не нужно: версия проверена на живых платах, а смена тянет за собой новый
 тулчейн и правку include-путей в `.clangd`.
 
+### Python 3.15 и чистая установка PlatformIO
+
+**Не чистить `~/.platformio` на этой машине, пока PIO работает на Python
+3.15.** Проверено 21.10.2026 сборкой в пустом `PLATFORMIO_CORE_DIR`: установка
+пакета `framework-espidf` создаёт питоновское окружение IDF и падает на сборке
+`pydantic-core` из исходников:
+
+```
+error: the configured Python interpreter version (3.15) is newer than PyO3's
+       maximum supported version (3.14)
+ERROR: Failed building wheel for pydantic-core
+ModuleNotFoundError: No module named 'idf_component_manager'
+```
+
+Причина не в проекте. `requirements.core.txt` из IDF тянет `pydantic 2.12.5`,
+а тот требует ровно `pydantic-core==2.41.5`; для неё готовые колёса есть под
+3.12 и 3.14, а под 3.15 нет — pip лезет собирать из исходников, и Rust-обвязка
+PyO3 3.15 ещё не знает.
+
+| Что | Готовые колёса `pydantic-core 2.41.5` |
+|---|---|
+| cp312, macOS arm64 и Linux | есть |
+| cp314, macOS arm64 | есть |
+| cp315 | **нет** |
+
+Отсюда два следствия:
+
+- **CI собирается** на `ubuntu-24.04` с `python-version: 3.12` — это и есть
+  причина, по которой версия в workflow зафиксирована числом, а не «последняя».
+- **На этой машине** всё живо только потому, что окружение IDF было создано
+  раньше, когда пин был другим. После `rm -rf ~/.platformio` сборка `env:bare`
+  не поднимется, пока PlatformIO не будет стоять на Python ≤ 3.14
+  (`~/.asdf/installs/python/3.14.2` подходит).
+
 **Плата без PSRAM.** Официальная документация это подтверждает. Не добавлять
 `-DBOARD_HAS_PSRAM` и не закладывать буферы, которые в 512 КБ не влезают.
 
@@ -78,19 +115,66 @@ basalt-os-mini/
 
 ## 4. Основные команды
 
+Две формы записи, обе правильные: `make` короче и не требует помнить env,
+`pio` — прямая и видна в логах. Логики в `Makefile` нет, он только называет
+команды, поэтому `pio` остаётся полноценным способом работы.
+
+```bash
+make help                        # список целей
+make                             # собрать env:bare
+make verify                      # то же, что CI: тесты, все env, образ
+make flash ENV=console           # собрать и залить конкретный env
+make log SECONDS=30              # читать лог 30 секунд
+```
+
 ```bash
 pio device list                  # список портов
-pio run                          # собрать
+pio run                          # собрать default_envs (сейчас console)
+pio run -e bare                  # собрать свой env: console, hello, bringup, bare, bare-panic
 pio run -t upload                # собрать и залить
 pio run -t compiledb             # пересобрать базу для clangd
 pio run -t erase                 # стереть flash
+pio test -e native               # тесты на маке, плата не нужна
+./tools/check-image.sh           # проверить собранный env:bare по символам, без платы
+./tools/smoke.sh                 # залить и сверить лог с платы (bare)
+./tools/smoke.sh bare-panic      # то же для паники
+./tools/reset.sh                 # вывести плату из загрузчика (USB-JTAG)
 ./tools/serial-read.sh 15        # прочитать лог 15 секунд
 ./tools/flash-backup.sh flash-id # чип, размер flash, MAC
 ```
 
+`ENV` в `Makefile` по умолчанию `bare`, потому что это свой код. В
+`platformio.ini` `default_envs` остаётся `console`: `pio run` без аргументов
+удобно тыкать в плату, когда она ведёт себя странно.
+
 `pio device monitor` работает **только в интерактивном терминале**. В скриптах,
 задачах Zed и любых pipe использовать `tools/serial-read.sh` (обёртка над
 pyserial из PlatformIO). Иначе порт просто не откроется.
+
+### Тесты
+
+Три уровня, у каждого своя цена и своё место:
+
+| Уровень | Чем | Что проверяет | Где запускается |
+|---|---|---|---|
+| логика на маке | `pio test -e native` (Unity) | переносимый код: форматирование, позже tty, парсер шелла, FAT32 | `test/`, CI |
+| собранный образ | `./tools/check-image.sh` | то, чего не видит компилятор: карта памяти своя, таблица векторов выровнена на 1 КБ, куча внутри DRAM | CI |
+| живая плата | `./tools/smoke.sh <env>` | лог: `ready`, тики, отчёт паники, причина сброса | вручную, плата в порту |
+
+- **На маке проверяется только переносимое.** Всё, что трогает регистры,
+  проверяется на плате: `env:bare` для обычной работы, `env:bare-panic` для
+  паники.
+- **`pio test -e native` собирает не весь проект, а список файлов** из
+  `build_src_filter` в `[env:native]`. Если тестируемый файл тянет `soc/...`,
+  он не соберётся. Правильный ход — вынести чистую логику в отдельный файл,
+  а не заводить `#ifdef` под тесты.
+- **Железо подменяется заглушкой в каталоге теста.** Пример:
+  `test/test_format/console_stub.c` реализует `basalt_console_write` в буфер,
+  поэтому тест видит ровно тот текст, который ушёл бы в терминал.
+- **Новая переносимая логика — с тестом.** Не «так принято», а потому что
+  ошибка в парсере на плате стоит вечера, а на маке — секунды.
+- **`tools/smoke.sh` в CI не входит:** платы на раннере нет. Это ручной прогон,
+  который не даёт забыть строку из «признака успеха».
 
 ### Прошивка Cardputer
 
@@ -154,8 +238,16 @@ libstdc++ тулчейна.
 **После правки `platformio.ini`** обязательно:
 
 ```bash
-pio run -t compiledb
+pio run -t compiledb          # база для default_envs (console)
+pio run -e bare -t compiledb  # база для bare
 ```
+
+**`compiledb` собирает базу только для одного env** — того, что указан в
+команде (или `default_envs`). Файл один, поэтому базы разных env'ов
+перезаписывают друг друга. Правило простое: база делается под тот env, код
+которого сейчас правится. Признак, что база не та: clangd не находит
+`tick.h`, `format.h` или `board_pins.h` — значит, в базе нет `-Iarch/xtensa/include`,
+то есть она от Arduino-сборки.
 
 Проверить, что конфиг живой, можно без редактора:
 
@@ -205,6 +297,8 @@ newlib** — clangd находит его по старой привычке и 
 | `pio device monitor` не работает в скрипте | нужен интерактивный TTY | `tools/serial-read.sh` |
 | `Failed to connect` / `Wrong boot mode (0x13)` | DTR/RTS не переводят чип в download | OFF + G0 вручную |
 | Порт не появился | кабель «только зарядка» | data-кабель |
+| Сборка `env:bare` падает на `pydantic-core` / `No module named 'idf_component_manager'` | PlatformIO на Python 3.15, готового колеса нет | Python ≤ 3.14 для PIO, см. раздел 3 |
+| `*** [/Users/tmp] /Users/tmp: Permission denied` на шаге линкер-скрипта | `PLATFORMIO_CORE_DIR` указывает внутрь `/tmp`: SCons склеивает путь и теряет первый уровень | держать каталог вне `/tmp`, например `~/pio-clean` |
 
 Грабли, специфичные для Cardputer (белый экран, инверсия цветов, конфликт G43
 между динамиком и микрофоном), — в `docs/board.md`. Грабли линкера и памяти —

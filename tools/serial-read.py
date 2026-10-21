@@ -22,7 +22,11 @@
     esptool --chip esp32s3 -p <порт> --before no-reset --after hard-reset read-mac
 После него порт пересоздаётся, поэтому читать надо с паузой.
 
-pyserial не поднимает линии сам (dsrdtr=False, rtscts=False) — только слушаем.
+ВТОРАЯ ГРАБЛЯ: открытие порта само перезапускает чип, и на время перезапуска
+USB-устройство исчезает. Уже открытый дескриптор после этого даёт
+`OSError: [Errno 6] Device not configured`, и наивный скрипт падает ровно
+тогда, когда лог ещё не начался. Поэтому порт переоткрывается сам, пока не
+выйдет время: за время чтения чип успевает подняться, и лог попадает в кадр.
 """
 import sys
 import time
@@ -40,31 +44,54 @@ KNOWN_VIDS = {0x303A, 0x1A86, 0x10C4, 0x0403}
 DURATION = float(sys.argv[1]) if len(sys.argv) > 1 else 10.0
 PORT = sys.argv[2] if len(sys.argv) > 2 else None
 
-if PORT is None:
+
+def find_port():
+    if PORT is not None:
+        return PORT
     found = [p for p in list_ports.comports() if p.vid in KNOWN_VIDS]
-    if not found:
+    return found[0].device if found else None
+
+
+def read_until(deadline, buf):
+    """Читает до deadline, переоткрывая порт. Возвращает (buf, число переоткрытий)."""
+    device = find_port()
+    if device is None:
         sys.exit('порт не найден, проверьте: pio device list')
-    PORT = found[0].device
 
-print(f'# порт {PORT}, {DURATION:.0f} c', file=sys.stderr)
+    print(f'# порт {device}, {DURATION:.0f} c', file=sys.stderr)
+    reopened = 0
+    while time.time() < deadline:
+        s = None
+        try:
+            s = serial.Serial(device, 115200, timeout=0.2, dsrdtr=False, rtscts=False)
+            # Явно опустить, но не переключать: RTS=1 на S3 означает режим загрузчика.
+            s.dtr = False
+            s.rts = False
+            s.reset_input_buffer()
+            while time.time() < deadline:
+                chunk = s.read(4096)
+                if chunk:
+                    buf += chunk
+        except Exception:
+            # Чип перезапустился или порт ещё не появился: ждём и пробуем снова.
+            reopened += 1
+            time.sleep(0.2)
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    return buf, reopened
 
-with serial.Serial(PORT, 115200, timeout=0.2, dsrdtr=False, rtscts=False) as s:
-    # Явно опустить, но не переключать: RTS=1 на S3 означает режим загрузчика.
-    s.dtr = False
-    s.rts = False
-    time.sleep(0.3)
-    s.reset_input_buffer()
 
-    end = time.time() + DURATION
-    buf = b''
-    while time.time() < end:
-        chunk = s.read(4096)
-        if chunk:
-            buf += chunk
+end = time.time() + DURATION
+data, reopened = read_until(end, b'')
 
-if buf:
-    sys.stdout.write(buf.decode('utf-8', 'replace'))
-    print(f'\n# получено {len(buf)} Б', file=sys.stderr)
+if data:
+    sys.stdout.write(data.decode('utf-8', 'replace'))
+    note = f', переоткрытий порта: {reopened}' if reopened else ''
+    print(f'\n# получено {len(data)} Б{note}', file=sys.stderr)
 else:
     print('# ни одного байта. Если прошивка точно залита, чип, вероятно, остался\n'
           '# в режиме загрузчика: сбросьте его через esptool (см. шапку файла).',

@@ -1,0 +1,110 @@
+# Сборка и тесты на каждый push и pull request.
+#
+# Что здесь проверяется и чего здесь быть не может:
+#
+#   tests  - хостовые тесты (pio test -e native): чистая логика, плата не
+#            нужна. Отдельная задача, потому что она быстрая: ошибка в
+#            format.c видна за минуту, и ждать восемь минут сборки прошивок
+#            незачем.
+#   firmware - все прошивки собираются, плюс проверка образа env:bare по
+#            символам (tools/check-image.sh).
+#
+# Чего здесь нет: проверок на живой плате. Тики, таблица векторов и паника
+# видны только в логе с платы - для этого tools/smoke.sh, а он требует
+# подключённый Cardputer. Такой запуск - отдельная работа (свой раннер), и
+# делать вид, что CI что-то проверил на железе, не нужно.
+
+name: сборка и тесты
+
+on:
+  # Ветки названы явно, а не «любые»: так push в feature-ветку не запускает
+  # второй такой же прогон рядом с pull request. Оба имени, потому что
+  # переименование master в main не должно молча выключать CI.
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# Новый push в ту же ветку отменяет предыдущий прогон: ждать сборку коммита,
+# который уже переписан, бессмысленно.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Версия PlatformIO фиксирована: сборка должна зависеть от кода, а не от
+  # того, что вышло на PyPI вчера. Обновлять вместе с platformio.ini, осознанно.
+  PLATFORMIO_VERSION: "6.2.0"
+  # Версия питона входит в ключ кэша: смена питона меняет и то, что
+  # устанавливается в ~/.platformio, кэш от старой версии только мешает.
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  tests:
+    name: тесты на хосте
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Кэш по содержимому platformio.ini: меняются платформы или библиотеки -
+      # кэш пересобирается. Иначе тянем заново ~1 ГБ пакетов каждый раз.
+      - name: кэш PlatformIO
+        uses: actions/cache@v4
+        with:
+          # Кэшируются только пакеты и платформы, без penv: внутри него
+          # виртуальное окружение с абсолютными путями, и кэш от другой версии
+          # питона его ломает. Пакеты же от версии питона не зависят.
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            .pio/libdeps
+            ~/.cache/pip
+          key: pio-tests-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-tests-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
+
+      - name: установить PlatformIO
+        run: pip install "platformio==${PLATFORMIO_VERSION}"
+
+      - name: тесты
+        run: pio test -e native
+
+  firmware:
+    name: прошивки
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: кэш PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            ~/.cache/pip
+          key: pio-firmware-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-firmware-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
+
+      - name: установить PlatformIO
+        run: pip install "platformio==${PLATFORMIO_VERSION}"
+
+      # all envs, а не default_envs: сломанный env, который собирается только
+      # вручную, узнаётся об этом через неделю.
+      - name: собрать все env
+        run: pio run -e console -e hello -e bringup -e bare -e bare-panic
+
+      # Обещания A0, которые сборка молча не проверяет: наша карта памяти,
+      # выравнивание таблицы векторов, границы кучи.
+      - name: проверить образ env:bare
+        run: ./tools/check-image.sh
