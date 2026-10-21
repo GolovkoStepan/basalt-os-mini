@@ -27,6 +27,7 @@ basalt-os-mini/
 ├── docs/
 │   ├── board.md         железо Cardputer: пины, драйверы, грабли, замеры
 │   ├── FUNCTIONALITY.md что система умеет — источник истины по терминалу
+│   ├── JOURNAL.md       журнал: что сделано, зачем и как проверить
 │   └── ROADMAP.md       вехи A0–A12
 ├── tools/               serial-read, flash-backup
 ├── src/                 (появится в A0)

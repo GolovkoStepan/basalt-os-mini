@@ -5,3 +5,9 @@ logs/
 backup/
 __pycache__/
 .DS_Store
+
+# Генерируется PlatformIO из sdkconfig.defaults при сборке env'ов на espidf.
+# Правится не он, а sdkconfig.defaults.
+sdkconfig.bare
+sdkconfig.bare-panic
+
