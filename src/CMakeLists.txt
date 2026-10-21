@@ -17,6 +17,8 @@ idf_component_register(
         "../arch/xtensa/led_ws2812.c"
         "../arch/xtensa/format.c"
         "../arch/xtensa/panic.c"
+        "../arch/xtensa/start.c"
+        "../arch/xtensa/start.S"
     INCLUDE_DIRS
         "../arch/xtensa/include"
 )

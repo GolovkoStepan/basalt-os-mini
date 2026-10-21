@@ -60,7 +60,7 @@ basalt-os-mini/
 |---|---|
 | PlatformIO Core | 6.2.0, `/opt/homebrew/bin/pio` |
 | Python для PIO | Homebrew `python@3.15` (отдельно от asdf) |
-| espressif32 | **8.0.0** → Arduino core 3.3.12 / IDF 5.5.5, xtensa GCC 14.2 |
+| espressif32 | **8.0.0** → Arduino core 3.3.12 / IDF 6.1.0, xtensa GCC 15.2, libc — **picolibc** |
 | esptool | `~/.platformio/packages/tool-esptool/esptool` |
 | Редактор | Zed + **esp-clangd 21.1.3** (`~/.local/opt/esp-clangd/bin/clangd`) |
 | ОС | macOS, arm64 |
@@ -144,7 +144,8 @@ pyserial из PlatformIO). Иначе порт просто не откроет�
 
 `compile_commands.json` отвечает за переход к определению в IDF, Arduino core
 и библиотеках. `.clangd` чинит то, что в базе есть, но clang не понимает:
-убирает три флага GCC и добавляет `-isystem` на newlib/libstdc++ тулчейна.
+убирает флаги GCC, которых clang не знает, и добавляет `-isystem` на libc и
+libstdc++ тулчейна.
 Без `.clangd` clangd не «просто не помогает» — он выдаёт больше ошибок, чем
 вообще без настройки.
 
@@ -157,22 +158,37 @@ pio run -t compiledb
 Проверить, что конфиг живой, можно без редактора:
 
 ```bash
-~/.local/opt/esp-clangd/bin/clangd --check=src/main.cpp
+~/.local/opt/esp-clangd/bin/clangd --check=src/bare/main.c
 ```
 
 Ожидаемый результат — `All checks completed, 0 errors`.
 
-### Хрупкое место: версия в путях
+### Хрупкое место: версия в путях и picolibc
 
-В `.clangd` пути содержат версию GCC (`.../14.2.0/...`). После обновления
-espressif32 или тулчейна их нужно поправить:
+Два независимых способа сломать clangd обновлением тулчейна.
+
+**1. Версия GCC в путях.** В `.clangd` она указана явно (`.../15.2.0/...`).
+После обновления espressif32 или тулчейна её нужно поправить:
 
 ```bash
 ls ~/.platformio/packages/toolchain-xtensa-esp-elf/lib/gcc/xtensa-esp-elf/
 ```
 
+**2. libc — это picolibc, а не newlib.** С GCC 15 прошивка собирается с
+`-specs=picolibc.specs`, и заголовки libc приходят из
+`toolchain-xtensa-esp-elf/picolibc/include`. Рядом, в
+`toolchain-xtensa-esp-elf/xtensa-esp-elf/include`, остаётся лежать **старый
+newlib** — clangd находит его по старой привычке и разбирает не тот набор
+заголовков. Диагностика характерная: `_mbstate_t unknown`, `__FILE unknown`,
+`stdbool.h file not found`. Лечится сменой пути на `picolibc/include`, а не
+версией GCC.
+
+**3. `-isystem` и путь — два элемента списка.** Одной строкой
+`- "-isystem /путь"` clangd 21 передаёт их одним аргументом, драйвер видит
+значение с ведущим пробелом и каталога не находит. В YAML это две строки.
+
 Если clangd перестал видеть стандартные заголовки (`<string>`, `<cstdint>`) —
-почти всегда причина в этом.
+почти всегда причина в одном из этих трёх мест.
 
 ---
 
