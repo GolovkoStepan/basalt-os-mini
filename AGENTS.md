@@ -23,14 +23,16 @@ basalt-os-mini/
 ├── AGENTS.md            этот файл
 ├── README.md            что за система и почему
 ├── .clangd              пути xtensa-тулчейна
-├── platformio.ini       (появится в A0)
+├── platformio.ini       env'ы console, hello, bringup, bare, bare-panic
+├── ld/memory.ld         карта памяти приложения (своя, не из IDF)
 ├── docs/
 │   ├── board.md         железо Cardputer: пины, драйверы, грабли, замеры
 │   ├── FUNCTIONALITY.md что система умеет — источник истины по терминалу
 │   ├── JOURNAL.md       журнал: что сделано, зачем и как проверить
 │   └── ROADMAP.md       вехи A0–A12
 ├── tools/               serial-read, flash-backup
-├── src/                 (появится в A0)
+├── src/                 точки входа env'ов: bare, bringup, hello, console
+├── arch/xtensa/         старт, векторы, паника, консоль, тик, светодиод
 └── include/
 ```
 
@@ -198,12 +200,15 @@ newlib** — clangd находит его по старой привычке и 
 |---|---|---|
 | `Unknown type name` для библиотечного типа | clangd не видит базу | `pio run -t compiledb` |
 | Автодополнение не видит новую библиотеку | устаревшая база | `pio run -t compiledb` |
+| Правка `ld/memory.ld` ничего не пересобирает | зависимость от линкер-скрипта висит только на сгенерированном IDF файле | удалить `.pio/build/<env>/firmware.elf` или `pio run -t clean` |
+| `undefined symbol` на имя из `#define` в `ld/memory.ld` | линкер-скрипт не проходит препроцессор C, `#` там — комментарий | числа задавать символами ld: `NAME = 0x…;` |
 | `pio device monitor` не работает в скрипте | нужен интерактивный TTY | `tools/serial-read.sh` |
 | `Failed to connect` / `Wrong boot mode (0x13)` | DTR/RTS не переводят чип в download | OFF + G0 вручную |
 | Порт не появился | кабель «только зарядка» | data-кабель |
 
 Грабли, специфичные для Cardputer (белый экран, инверсия цветов, конфликт G43
-между динамиком и микрофоном), — в `docs/board.md`.
+между динамиком и микрофоном), — в `docs/board.md`. Грабли линкера и памяти —
+там же, раздел «Память и разделы».
 
 ---
 

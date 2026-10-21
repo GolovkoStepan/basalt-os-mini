@@ -1,11 +1,12 @@
 // A0, шаг 3: своя точка входа.
 //
-// Что здесь своего: вывод в USB Serial/JTAG (arch/xtensa/console_usb_jtag.c),
+// Что своего: вывод в USB Serial/JTAG (arch/xtensa/console_usb_jtag.c),
 // счётчик времени (arch/xtensa/tick.c), WS2812 через RMT
 // (arch/xtensa/led_ws2812.c), обработчик исключений (arch/xtensa/panic.c),
-// своя таблица векторов (arch/xtensa/vectors.S, vectors.c) и точка входа
-// (arch/xtensa/start.S, start.c) - всё по регистрам периферии.
-// Что пока чужое: линкер-скрипт штатный, см. JOURNAL.
+// своя таблица векторов (arch/xtensa/vectors.S, vectors.c), точка входа
+// (arch/xtensa/start.S, start.c) и карта памяти (ld/memory.ld).
+// Что пока чужое: call_start_cpu0 из IDF (кэш, MMU, обнуление BSS) и каталог
+// секций sections.ld, см. JOURNAL.
 //
 // Проверка: в терминале идёт баннер, затем строка tick раз в секунду,
 // и на каждый тик мигает зелёный светодиод.
@@ -69,7 +70,8 @@ void basalt_main(void)
     basalt_put_hex(basalt_vectors_address(), 8);
     basalt_put("\n");
     basalt_put("[start] своя точка входа: start_cpu0 → basalt_start, FreeRTOS не запускается\n");
-    basalt_put("[start] чужое: call_start_cpu0 (кэш, MMU, BSS), линкер\n");
+    basalt_put("[ld] своя карта памяти: ld/memory.ld, числа проверены при сборке\n");
+    basalt_put("[start] чужое: call_start_cpu0 (кэш, MMU, BSS), sections.ld\n");
     basalt_put("ready\n\n");
 
     uint32_t tick = 0;
