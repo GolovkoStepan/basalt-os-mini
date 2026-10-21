@@ -15,6 +15,8 @@ idf_component_register(
         "../arch/xtensa/console_usb_jtag.c"
         "../arch/xtensa/tick.c"
         "../arch/xtensa/led_ws2812.c"
+        "../arch/xtensa/format.c"
+        "../arch/xtensa/panic.c"
     INCLUDE_DIRS
         "../arch/xtensa/include"
 )

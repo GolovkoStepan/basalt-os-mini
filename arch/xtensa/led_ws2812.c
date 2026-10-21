@@ -65,6 +65,10 @@
 // Результат проверки памяти, см. basalt_led_memory_ok().
 static bool mem_writable;
 
+// Инициализирован ли драйвер. Нужен панике: она хочет зажечь красный, но
+// до инициализации трогать RMT нельзя - он ещё не тактируется.
+static bool ready;
+
 // Длительность последнего кадра в микросекундах, см. basalt_led_frame_us().
 static uint32_t last_frame_us;
 
@@ -221,6 +225,13 @@ void basalt_led_init(void)
     // Погасить: на плате до сброса мог остаться цвет от прошлой прошивки,
     // WS2812 его защёлкивает и держит, пока не придёт новый кадр.
     basalt_led_set(0, 0, 0);
+
+    ready = true;
+}
+
+bool basalt_led_ready(void)
+{
+    return ready;
 }
 
 bool basalt_led_memory_ok(void)
