@@ -19,4 +19,3 @@
 // Точка входа в нашу систему. Вызывается из basalt_start на своём стеке.
 // Не возвращается никогда.
 void basalt_main(void) __attribute__((noreturn));
-
