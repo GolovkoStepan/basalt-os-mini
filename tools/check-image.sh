@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Проверка собранного образа env:bare по таблице символов. Плата не нужна.
+# Проверка собранного образа по таблице символов. Плата не нужна.
 #
 # Зачем: часть обещаний A0 невидима компилятору и молча ломается - таблица
 # векторов перестала быть выровнена на 1 КБ, карта памяти подменилась чужой,
 # куча оказалась вне DRAM. Всё это проявляется уже на плате, и искать причину
 # там дорого. Здесь те же обещания проверяются за секунду.
 #
-#   ./tools/check-image.sh                      # .pio/build/bare/firmware.elf
+#   ./tools/check-image.sh                      # .pio/build/tdisplay/firmware.elf
+#   ./tools/check-image.sh tdisplay
+#   ./tools/check-image.sh bare                 # та же проверка на Cardputer
 #   ./tools/check-image.sh путь/к/firmware.elf
 #
 # Код возврата: 0 - всё сошлось, 1 - что-то не так.
@@ -15,10 +17,16 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-ELF="${1:-.pio/build/bare/firmware.elf}"
+# Аргумент - либо имя env, либо путь к файлу. Имя удобнее: env'ов уже семь, и
+# помнить, что «проверка образа» относится к одной конкретной сборке, не надо.
+ARG="${1:-tdisplay}"
+case "$ARG" in
+    */*|*.elf) ELF="$ARG" ;;
+    *)         ELF=".pio/build/$ARG/firmware.elf" ;;
+esac
 
 if [ ! -f "$ELF" ]; then
-    echo "нет файла $ELF - сначала: pio run -e bare" >&2
+    echo "нет файла $ELF - сначала: pio run -e ${ARG%.elf}" >&2
     exit 1
 fi
 

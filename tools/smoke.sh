@@ -6,9 +6,10 @@
 # это сверялось глазами. Глазами признак успеха проверяют один раз, а скрипт -
 # каждый раз, и он же не даёт «вроде работает».
 #
-#   ./tools/smoke.sh                # env:bare  (по умолчанию)
-#   ./tools/smoke.sh bare-panic
-#   ./tools/smoke.sh console
+#   ./tools/smoke.sh                  # env:tdisplay (по умолчанию)
+#   ./tools/smoke.sh tdisplay-panic
+#   ./tools/smoke.sh bare             # Cardputer
+#   ./tools/smoke.sh console          # Cardputer
 #
 # Код возврата: 0 - все ожидаемые строки на месте, 1 - нет.
 
@@ -16,14 +17,14 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-ENV="${1:-bare}"
+ENV="${1:-tdisplay}"
 
 # Сколько секунд читать и что обязано быть в логе. Строки повторяют «признак
 # успеха» из JOURNAL.md. Дублирование намеренное: журнал читает человек, а
 # скрипту нужен список для grep. Если меняется вывод прошивки, правится оба
 # места - иначе проверка начнёт врать.
 case "$ENV" in
-    bare)
+    tdisplay|bare)
         # 26 секунд, а не 12: раньше проверка читала 12 секунд и не видела,
         # что прошивка тихо перезагружается на девятой. Требование "дожить до
         # tick 20" - это и есть проверка "не перезагружается".
@@ -37,7 +38,7 @@ case "$ENV" in
             'tick 20'
         )
         ;;
-    bare-panic)
+    tdisplay-panic|bare-panic)
         # Падение на 5-й секунде, отчёт, пауза 3 с, сброс. Меньше 14 с читать
         # нельзя: не увидим ни паники, ни причины сброса.
         READ_SECONDS=16
@@ -62,7 +63,7 @@ case "$ENV" in
     # проходит через раз, хуже отсутствия проверки. Заодно после заливки hello
     # чип перестал отвечать esptool до ручного G0 - см. docs/board.md, грабли.
     *)
-        echo "не знаю env '$ENV'. Есть: bare, bare-panic, console" >&2
+        echo "не знаю env '$ENV'. Есть: tdisplay, tdisplay-panic, bare, bare-panic, console" >&2
         exit 1
         ;;
 esac

@@ -1,4 +1,5 @@
-// WS2812 на G21 через RMT - по регистрам, без esp_driver_rmt.
+// Индикатор жизни на Cardputer: WS2812 на G21 через RMT - по регистрам,
+// без esp_driver_rmt. Интерфейс - indicator.h.
 //
 // Как устроен кадр. WS2812 принимает 24 бита (по 8 на зелёный, красный, синий,
 // старшим битом вперёд), и каждый бит кодируется длиной высокого уровня:
@@ -17,9 +18,10 @@
 //  - порядок байт у WS2812 не RGB, а GRB;
 //  - без сброса указателя чтения второй кадр начнётся с середины памяти.
 
-#include "led_ws2812.h"
+#include "indicator.h"
 
 #include "board_pins.h"
+#include "pin_gpio.h"
 #include "tick.h"
 
 #include "soc/gpio_reg.h"
@@ -62,47 +64,15 @@
 #define LED_MEM_WORDS 48u
 #define LED_FRAME_WORDS 24u
 
-// Результат проверки памяти, см. basalt_led_memory_ok().
+// Результат проверки памяти, см. basalt_indicator_memory_ok().
 static bool mem_writable;
 
 // Инициализирован ли драйвер. Нужен панике: она хочет зажечь красный, но
 // до инициализации трогать RMT нельзя - он ещё не тактируется.
 static bool ready;
 
-// Длительность последнего кадра в микросекундах, см. basalt_led_frame_us().
+// Длительность последнего кадра в микросекундах, см. basalt_indicator_frame_us().
 static uint32_t last_frame_us;
-
-// Пин как обычный выход, поднятый в единицу.
-//
-// Зачем отдельная функция: у ESP32-S3 пины 0..31 и 32..48 живут в разных
-// наборах регистров, и одним сдвигом на 38 бит нужный бит не адресовать -
-// компилятор справедливо ругается на переполнение сдвига.
-static void pin_output_high(unsigned pin)
-{
-    const uint32_t bit = 1u << (pin & 31u);
-    if (pin < 32) {
-        SET_PERI_REG_MASK(GPIO_ENABLE_W1TS_REG, bit);
-        SET_PERI_REG_MASK(GPIO_OUT_W1TS_REG, bit);
-    } else {
-        SET_PERI_REG_MASK(GPIO_ENABLE1_W1TS_REG, bit);
-        SET_PERI_REG_MASK(GPIO_OUT1_W1TS_REG, bit);
-    }
-}
-
-// Переключить IO_MUX на функцию GPIO.
-//
-// Нужно потому, что пин по умолчанию может быть отдан другой периферии, и
-// тогда сигнал с матрицы GPIO до ножки не доходит вообще. В Arduino это
-// делал pinMode внутри себя, здесь приходится явно.
-static void pin_as_gpio(unsigned pin)
-{
-    if (pin < SOC_GPIO_PIN_COUNT) {
-        const uint32_t reg = GPIO_PIN_MUX_REG[pin];
-        if (reg != 0) {
-            REG_SET_FIELD(reg, MCU_SEL, PIN_FUNC_GPIO);
-        }
-    }
-}
 
 // Проверка «память канала вообще доступна на запись».
 //
@@ -177,13 +147,18 @@ static void send_grb(uint8_t g, uint8_t r, uint8_t b)
     basalt_delay_us(LED_RESET_US);
 }
 
-void basalt_led_init(void)
+const char* basalt_indicator_name(void)
+{
+    return "WS2812 на G21 через RMT, 10 МГц, порядок GRB";
+}
+
+void basalt_indicator_init(void)
 {
     // Питание светодиода. На Cardputer оно висит на линии подсветки G38, и
     // поднимаем её явно: без этого светодиод может не загореться вовсе,
     // независимо от того, что приходит по данным. Побочный эффект - вместе
     // со светодиодом включается подсветка экрана.
-    pin_output_high(PIN_DISP_BL);
+    pin_gpio_output(PIN_DISP_BL, true);
 
     // Сброс и тактирование блока. Сброс нужен, чтобы не зависеть от того,
     // в каком состоянии RMT оставил загрузчик.
@@ -215,7 +190,6 @@ void basalt_led_init(void)
     // разрешению от периферии. Иначе в паузах между кадрами пин оказался бы
     // отключён, и «прижатый ноль» из настроек канала ни на что бы не влиял.
     pin_as_gpio(PIN_RGB_LED_G21);
-    pin_as_gpio(PIN_DISP_BL);
     SET_PERI_REG_MASK(GPIO_ENABLE_W1TS_REG, 1u << PIN_RGB_LED_G21);
     WRITE_PERI_REG(GPIO_FUNC0_OUT_SEL_CFG_REG + 4u * PIN_RGB_LED_G21,
                    RMT_SIG_OUT0_IDX);
@@ -224,27 +198,27 @@ void basalt_led_init(void)
 
     // Погасить: на плате до сброса мог остаться цвет от прошлой прошивки,
     // WS2812 его защёлкивает и держит, пока не придёт новый кадр.
-    basalt_led_set(0, 0, 0);
+    basalt_indicator_set(0, 0, 0);
 
     ready = true;
 }
 
-bool basalt_led_ready(void)
+bool basalt_indicator_ready(void)
 {
     return ready;
 }
 
-bool basalt_led_memory_ok(void)
+bool basalt_indicator_memory_ok(void)
 {
     return mem_writable;
 }
 
-uint32_t basalt_led_frame_us(void)
+uint32_t basalt_indicator_frame_us(void)
 {
     return last_frame_us;
 }
 
-void basalt_led_set(uint8_t r, uint8_t g, uint8_t b)
+void basalt_indicator_set(uint8_t r, uint8_t g, uint8_t b)
 {
     send_grb(g, r, b);
 }

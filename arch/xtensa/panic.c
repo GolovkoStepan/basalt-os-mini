@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 #include "format.h"
-#include "led_ws2812.h"
+#include "indicator.h"
 #include "tick.h"
 
 #include "soc/rtc_cntl_reg.h"
@@ -194,9 +194,11 @@ void basalt_panic_exc(basalt_frame_t* frame)
     }
     in_panic = true;
 
-    // Красный первым делом: пока печатается лог, цвет уже виден.
-    if (basalt_led_ready()) {
-        basalt_led_set(200, 0, 0);
+    // Индикатор первым делом: пока печатается лог, признак поломки уже виден.
+    // На Cardputer это красный светодиод, на T-Display-S3 - включённая
+    // подсветка: цвета у неё нет, и просить красный бессмысленно.
+    if (basalt_indicator_ready()) {
+        basalt_indicator_set(200, 0, 0);
     }
 
     basalt_put("\n\n!!!!!! PANIC !!!!!!\n");

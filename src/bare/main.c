@@ -1,30 +1,34 @@
 // A0, шаг 3: своя точка входа.
 //
 // Что своего: вывод в USB Serial/JTAG (arch/xtensa/console_usb_jtag.c),
-// счётчик времени (arch/xtensa/tick.c), WS2812 через RMT
-// (arch/xtensa/led_ws2812.c), обработчик исключений (arch/xtensa/panic.c),
+// счётчик времени (arch/xtensa/tick.c), индикатор жизни
+// (arch/xtensa/indicator_*.c), обработчик исключений (arch/xtensa/panic.c),
 // своя таблица векторов (arch/xtensa/vectors.S, vectors.c), точка входа
 // (arch/xtensa/start.S, start.c) и карта памяти (ld/memory.ld).
 // Что пока чужое: call_start_cpu0 из IDF (кэш, MMU, обнуление BSS) и каталог
 // секций sections.ld, см. JOURNAL.
 //
-// Проверка: в терминале идёт баннер, затем строка tick раз в секунду,
-// и на каждый тик мигает зелёный светодиод.
+// Проверка: в терминале идёт баннер, затем строка tick раз в секунду, и на
+// каждый тик срабатывает индикатор - светодиод на Cardputer, подсветка экрана
+// на T-Display-S3. Один и тот же файл собирается под обе платы: различие между
+// ними ровно одно, чем сигналить, и живёт оно в драйвере индикатора.
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "console_usb_jtag.h"
 #include "format.h"
-#include "led_ws2812.h"
+#include "indicator.h"
 #include "panic.h"
 #include "start.h"
 #include "tick.h"
 #include "vectors.h"
 
 // Яркость индикатора. Полные 255 бьют по глазам в тёмной комнате, а задача
-// светодиода - «видно с другого конца стола», а не «осветить стол».
-#define LED_ALIVE_LEVEL 40
+// индикатора - «видно с другого конца стола», а не «осветить стол». На плате
+// без светодиода (T-Display-S3) число не используется: подсветка включается
+// на любом ненулевом цвете.
+#define INDICATOR_ALIVE_LEVEL 40
 
 // ---------------------------------------------------------------------------
 
@@ -47,7 +51,7 @@ void basalt_main(void)
     // Своя таблица векторов - до работы с периферией: любая её ошибка должна
     // попадать уже в наш обработчик.
     basalt_vectors_init();
-    basalt_led_init();
+    basalt_indicator_init();
 
     const uint64_t t_boot = basalt_uptime_us();
 
@@ -60,9 +64,13 @@ void basalt_main(void)
     // Одной строкой - состояние светодиода при старте. Если он молчит,
     // первым делом надо знать, дошли ли кадры до передатчика и с какой
     // частотой они ушли: без этих двух чисел отладка начинается с нуля.
-    basalt_put("[led] WS2812 на G21 через RMT, 10 МГц, порядок GRB, память ");
-    basalt_put(basalt_led_memory_ok() ? "ok, кадр " : "НЕ ПИШЕТСЯ, кадр ");
-    basalt_put_u64(basalt_led_frame_us());
+    // Текст про индикатор берётся у драйвера: у плат он разный, а лог должен
+    // описывать то, что реально собрано, а не то, что было на прошлой плате.
+    basalt_put("[indicator] ");
+    basalt_put(basalt_indicator_name());
+    basalt_put(basalt_indicator_memory_ok() ? ", память ok, кадр "
+                                           : ", память НЕ ПИШЕТСЯ, кадр ");
+    basalt_put_u64(basalt_indicator_frame_us());
     basalt_put(" мкс\n");
 
     basalt_put("[panic] свой обработчик исключений, свой кадр регистров\n");
@@ -110,14 +118,14 @@ void basalt_main(void)
 
             // Вспышка на тик - признак жизни, который видно без терминала:
             // кабель отключён, порт закрыт, а плата работает.
-            basalt_led_set(0, LED_ALIVE_LEVEL, 0);
+            basalt_indicator_set(0, INDICATOR_ALIVE_LEVEL, 0);
             led_off_at = now + 80000u;
         }
 
         // Гасим по времени, а не задержкой: цикл продолжает обслуживать
         // консоль, пока светодиод горит.
         if (led_off_at != 0 && now >= led_off_at) {
-            basalt_led_set(0, 0, 0);
+            basalt_indicator_set(0, 0, 0);
             led_off_at = 0;
         }
 

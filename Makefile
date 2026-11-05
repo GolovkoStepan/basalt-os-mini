@@ -6,26 +6,25 @@
 # может закончиться не тем env. Здесь только имена: вся логика остаётся в
 # platformio.ini и tools/, чтобы не завести второй источник правды.
 #
-# ENV по умолчанию bare, а не console. bare - свой код, то есть проект.
-# console - прошивка «проверить, что плата отвечает»; default_envs в
-# platformio.ini остаётся console, потому что pio run без аргументов удобно
-# тыкать в плату, когда она ведёт себя странно.
+# ENV по умолчанию tdisplay: основная плата проекта - LilyGO T-Display-S3.
+# env:bare и env:console - Cardputer, они ещё собираются, но проект переезжает.
 #
 # Грабли: make flash ENV=hello заливает щуп, после которого плата перестаёт
 # отвечать esptool до ручного G0 (docs/board.md, §9). Собирать его при этом
 # можно и нужно - он входит в verify.
 #
 # pio остаётся доступен напрямую: make - сокращение, а не замена. Если сборка
-# упирается в питон, на котором стоит PlatformIO, его можно подменить:
-#   make build PIO=~/.asdf/installs/python/3.14.2/bin/pio
+# упирается в питон, на котором стоит PlatformIO (на этой машине он должен
+# быть ≤ 3.14, иначе IDF-окружение не установится), его можно подменить:
+#   make build PIO=~/.venvs/pio314/bin/pio
 
-ENV ?= bare
+ENV ?= tdisplay
 SECONDS ?= 15
 PIO ?= pio
 
 # Список env для verify. Должен совпадать с .github/workflows/build.yml:
 # сломанный env, который собирается только вручную, обнаруживают через неделю.
-ENVS ?= console hello bringup bare bare-panic
+ENVS ?= tdisplay tdisplay-panic console hello bringup bare bare-panic
 
 # Порт нужен, только если в системе больше одной платы.
 PORT_ARG = $(if $(PORT),--upload-port $(PORT),)
@@ -38,7 +37,7 @@ all: build
 help: ## этот список
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  make %-11s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-build: ## собрать ENV (по умолчанию bare)
+build: ## собрать ENV (по умолчанию tdisplay)
 	$(PIO) run -e $(ENV)
 
 flash: ## собрать и залить; порт: make flash PORT=/dev/cu.usbmodem101
@@ -53,13 +52,14 @@ monitor: ## интерактивный монитор; годится тольк
 test: ## тесты на маке, плата не нужна
 	$(PIO) test -e native
 
-check: ## проверить образ bare по символам, плата не нужна
-	./tools/check-image.sh
+check: ## проверить образ ENV по символам, плата не нужна
+	./tools/check-image.sh $(ENV)
 
 verify: ## то же, что CI: тесты, сборка всех env, проверка образа
 	$(PIO) test -e native
 	$(PIO) run $(addprefix -e ,$(ENVS))
-	./tools/check-image.sh
+	./tools/check-image.sh tdisplay
+	./tools/check-image.sh bare
 
 smoke: ## залить ENV и сверить лог с «признаком успеха» (плата нужна)
 	./tools/smoke.sh $(ENV)
