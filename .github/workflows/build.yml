@@ -102,13 +102,16 @@ jobs:
       # all envs, а не default_envs: сломанный env, который собирается только
       # вручную, узнаётся об этом через неделю.
       - name: собрать все env
-        run: pio run -e tdisplay -e tdisplay-panic -e probe -e lcd -e console -e hello -e bringup -e bare -e bare-panic
+        run: pio run -e tdisplay -e tdisplay-panic -e probe -e lcd -e text -e console -e hello -e bringup -e bare -e bare-panic
 
       # Обещания A0, которые сборка молча не проверяет: наша карта памяти,
       # выравнивание таблицы векторов, границы кучи. Обе платы: карта памяти
       # у них одна и та же (уровень чипа), и это как раз стоит проверять -
-      # если разойдётся, значит карту подменили.
+      # если разойдётся, значит карту подменили. Плюс text: это отдельное
+      # приложение на той же карте, и у него своя статика (сетка, полоса) -
+      # если она перерастёт DRAM, начало кучи уедет, и это видно здесь.
       - name: проверить образы
         run: |
           ./tools/check-image.sh tdisplay
           ./tools/check-image.sh bare
+          ./tools/check-image.sh text

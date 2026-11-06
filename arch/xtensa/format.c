@@ -17,10 +17,11 @@ void basalt_put(const char* s)
     }
 }
 
-void basalt_put_u64(uint64_t v)
+// Запись справа налево: так не нужно заранее знать число цифр и не приходится
+// разворачивать строку потом.
+const char* basalt_format_u64(char* buf, size_t cap, uint64_t v)
 {
-    char buf[21];
-    int i = (int)sizeof(buf) - 1;
+    int i = (int)cap - 1;
     buf[i] = '\0';
     if (v == 0) {
         buf[--i] = '0';
@@ -29,7 +30,13 @@ void basalt_put_u64(uint64_t v)
         buf[--i] = (char)('0' + (v % 10));
         v /= 10;
     }
-    basalt_put(&buf[i]);
+    return &buf[i];
+}
+
+void basalt_put_u64(uint64_t v)
+{
+    char buf[21];
+    basalt_put(basalt_format_u64(buf, sizeof(buf), v));
 }
 
 void basalt_put_hex(uint32_t v, int digits)

@@ -157,7 +157,7 @@ basalt-os-mini/
 ├── AGENTS.md                правила этого репозитория
 ├── Makefile                 короткие имена команд: make help
 ├── .clangd                  пути xtensa-тулчейна
-├── platformio.ini           [base] + env: tdisplay, tdisplay-panic, bare, bare-panic, console, hello, bringup, native
+├── platformio.ini           [base] + env: tdisplay, tdisplay-panic, probe, lcd, text, bare, bare-panic, console, hello, bringup, native
 ├── ld/memory.ld             карта памяти приложения (своя, не из IDF)
 ├── boards/tdisplay_s3/      board_pins.h основной платы
 ├── boards/cardputer/        board_pins.h Cardputer (уезжает в capsh)

@@ -27,14 +27,25 @@ else()
     set(BASALT_LCD_SRC       "")
 endif()
 
-# Приложение тоже выбирается сборкой: env:probe и env:lcd - тот же старт и та
-# же консоль, но другой main.c. Второй копии arch/ при этом не появляется, и ни
-# один общий файл не обрастает ветвлениями «а в щупе иначе»: различие ровно в
-# одном файле.
+# Приложение тоже выбирается сборкой: env:probe, env:lcd и env:text - тот же
+# старт и та же консоль, но другой main.c. Второй копии arch/ при этом не
+# появляется, и ни один общий файл не обрастает ветвлениями «а в щупе иначе»:
+# различие ровно в одном файле.
+#
+# Текстовая матрица подключается только текстовому env. В env:bare её файлы не
+# нужны, а проверенную сборку A0 незачем увеличивать мёртвым кодом: пересборка
+# с другим env ничего не должна менять в уже работающей прошивке.
+set(BASALT_TEXT_SRC "")
+set(BASALT_TEXT_INC "")
+
 if(BASALT_APP_PROBE)
     set(BASALT_APP_SRC "probe/main.c")
 elseif(BASALT_APP_LCD)
     set(BASALT_APP_SRC "lcd/main.c")
+elseif(BASALT_APP_TEXT)
+    set(BASALT_APP_SRC "text/main.c")
+    set(BASALT_TEXT_SRC "../text/matrix.c")
+    set(BASALT_TEXT_INC "../text")
 else()
     set(BASALT_APP_SRC "bare/main.c")
 endif()
@@ -53,8 +64,10 @@ idf_component_register(
         "../arch/xtensa/start.S"
         "../arch/xtensa/heap.c"
         ${BASALT_LCD_SRC}
+        ${BASALT_TEXT_SRC}
     INCLUDE_DIRS
         "../arch/xtensa/include"
         "../drivers"
         ${BASALT_BOARD_DIR}
+        ${BASALT_TEXT_INC}
 )
