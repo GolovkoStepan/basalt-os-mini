@@ -46,6 +46,7 @@ case "$ENV" in
         PATTERNS=(
             '[shell] экран'
             '[shell] ФС storage'
+            '[shell] /etc/rc'
             'ready'
         )
         ;;

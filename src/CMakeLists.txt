@@ -91,6 +91,7 @@ elseif(BASALT_APP_SHELL)
     set(BASALT_SHELL_SRC
         "../shell/parse.c"
         "../shell/redirect.c"
+        "../shell/xmodem.c"
         "../shell/history.c"
         "../shell/lineedit.c"
     )

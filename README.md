@@ -100,6 +100,20 @@ make verify          # то же, что CI: тесты, все env, прове�
 
 `ENV` по умолчанию `tdisplay` — это основная плата. `ENV=bare` — Cardputer.
 
+Заливка файла в ФС платы — не через `make`, а скриптом по той же консоли:
+
+```bash
+./tools/xsend.sh notes.txt /etc/notes.txt   # XMODEM, ~21 КБ/с
+```
+
+Посмотреть, что лежит в ФС, можно и без работающей прошивки — скрипт читает
+раздел через загрузчик и разбирает BFS на маке:
+
+```bash
+./tools/fsdump.py                # дерево ФС
+./tools/fsdump.py --save fs.bin  # дамп остаётся, дальше --read fs.bin
+```
+
 `make compiledb` собирает базу под **один** env: файл
 `compile_commands.json` один, базы разных env перезаписывают друг друга.
 Для работы с `arch/xtensa` нужна база от `tdisplay` — она и делается по
@@ -166,9 +180,9 @@ basalt-os-mini/
 ├── boards/cardputer/        board_pins.h Cardputer (уезжает в capsh)
 ├── docs/
 ├── tty/                     line discipline: канон и raw, эхо, Backspace, Ctrl-C/D
-├── shell/                   шелл: история, редактор строки, разбор, план выполнения
+├── shell/                   шелл: история, редактор, разбор, план выполнения, XMODEM
 ├── storage/                 хранилище: таблица разделов, своя ФС BFS, VFS
-├── tools/                   serial-read, flash-backup, check-image, smoke, reset
+├── tools/                   serial-read, xsend, fsdump, flash-backup, check-image, smoke, reset
 ├── test/                    хостовые тесты (Unity)
 ├── src/                     точки входа env'ов + CMakeLists с выбором платы
 ├── arch/xtensa/             старт, векторы, паника, консоль, тик, индикатор, куча, flash

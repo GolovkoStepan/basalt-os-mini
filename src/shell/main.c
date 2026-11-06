@@ -40,6 +40,7 @@
 #include "vectors.h"
 #include "vfs.h"
 #include "vfs_bfs.h"
+#include "xmodem.h"
 
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
@@ -712,6 +713,11 @@ static void cmd_crash(int argc, char** argv)
 // держит указатель на bfs_t всё время работы.
 static bfs_t s_fs;
 
+// Корень смонтирован. Отдельный флаг, а не проверка указателей: при отказе
+// хранилища система поднимается без файлов, и всё файловое должно это видеть,
+// а не выяснять по коду ошибки от каждой операции.
+static bool s_fs_ready;
+
 // Текст ошибки. Свои коды монтирования (BASALT_FS_*) и коды VFS_* численно
 // пересекаются, поэтому проверяются первыми.
 static void out_fs_error(int rc)
@@ -768,8 +774,152 @@ static void fs_mount_root(void)
         return;
     }
 
+    s_fs_ready = true;
+
     basalt_put("[shell] ФС storage: ");
     basalt_put(formatted ? "размечена заново\n" : "смонтирована\n");
+}
+
+// --- /etc/rc: что делать при старте ---------------------------------------
+//
+// Зачем системе создавать этот файл самой. После `pio run -t erase` корень
+// пуст, и записать «что делать при старте» негде: первый запуск ничем не
+// отличается от второго, а любая настройка живёт до перезагрузки. Пустой
+// шаблон с объяснением внутри решает это без отдельной команды `mkfs -c`.
+//
+// Файл создаётся один раз и больше не перезаписывается: правки пользователя
+// важнее шаблона, а затереть их при обновлении прошивки было бы худшим из
+// возможных сюрпризов.
+
+#define RC_DIR  "/etc"
+#define RC_PATH "/etc/rc"
+
+static const char s_rc_default[] =
+    "# /etc/rc - команды, которые выполняются при старте системы.\n"
+    "# По одной в строке, как в шелле; # - комментарий.\n"
+    "# Например: echo привет\n";
+
+static void run_command(const char* line);
+
+static void fs_ensure_rc(void)
+{
+    if (!s_fs_ready) {
+        return;
+    }
+
+    // Каталог мог остаться от прошлой жизни, а мог и не быть: и то и другое
+    // нормально, поэтому «уже есть» - не ошибка.
+    const int mk = vfs_mkdir(RC_DIR);
+    if (mk != VFS_OK && mk != VFS_ERR_EXISTS) {
+        out_diag(RC_DIR ": ");
+        out_fs_error(mk);
+        out_diag("\n");
+        return;
+    }
+
+    vfs_stat_t st;
+    if (vfs_stat(RC_PATH, &st) == VFS_OK) {
+        return;
+    }
+
+    int fd = -1;
+    int rc = vfs_open(RC_PATH, VFS_O_WRONLY | VFS_O_CREATE, &fd);
+    if (rc != VFS_OK) {
+        out_diag(RC_PATH ": ");
+        out_fs_error(rc);
+        out_diag("\n");
+        return;
+    }
+
+    const uint32_t len = (uint32_t)(sizeof(s_rc_default) - 1);
+    uint32_t put = 0;
+    rc = vfs_write(fd, s_rc_default, len, &put);
+    vfs_close(fd);
+
+    if (rc != VFS_OK || put != len) {
+        out_diag(RC_PATH ": не удалось записать шаблон\n");
+    }
+}
+
+// Выполнить /etc/rc строка за строкой. Свой разборщик строк, а не общий с
+// редактором: файл приходит с мака, где конец строки - CRLF, и `\r` в конце
+// команды сломал бы последнее слово (`rm /x` + CR = имя `/x\r`).
+//
+// Строку длиннее буфера редактора пропускаем целиком, а не режем: обрезанная
+// команда выполнилась бы не с теми аргументами, и это хуже, чем не выполнена
+// вовсе.
+#define RC_LINE_MAX LINEEDIT_CAP
+
+static void fs_run_rc(void)
+{
+    if (!s_fs_ready) {
+        return;
+    }
+
+    int fd = -1;
+    if (vfs_open(RC_PATH, VFS_O_RDONLY, &fd) != VFS_OK) {
+        return;  // файла нет - нечего выполнять, и это не ошибка
+    }
+
+    char line[RC_LINE_MAX];
+    size_t len = 0;
+    bool overlong = false;
+    uint32_t commands = 0;
+    uint8_t chunk[128];
+
+    for (;;) {
+        uint32_t got = 0;
+        if (vfs_read(fd, chunk, sizeof(chunk), &got) != VFS_OK || got == 0) {
+            break;
+        }
+
+        for (uint32_t i = 0; i < got; ++i) {
+            const char c = (char)chunk[i];
+
+            if (c != '\n') {
+                if (c == '\r') {
+                    continue;
+                }
+                if (len + 1 < sizeof(line)) {
+                    line[len++] = c;
+                } else {
+                    overlong = true;
+                }
+                continue;
+            }
+
+            line[len] = '\0';
+            len = 0;
+
+            if (overlong) {
+                out_diag(RC_PATH ": строка слишком длинная, пропущена\n");
+                overlong = false;
+                continue;
+            }
+            if (line[0] == '\0') {
+                continue;
+            }
+
+            run_command(line);
+            ++commands;
+        }
+    }
+
+    // Последняя строка может быть без перевода строки: файл, собранный на
+    // маке или записанный `echo` без него, - обычное дело.
+    line[len] = '\0';
+    if (!overlong && len > 0) {
+        run_command(line);
+        ++commands;
+    }
+
+    vfs_close(fd);
+
+    // «Прочитано», а не «выполнено»: комментарии и пустые строки тоже
+    // считаются, и называть их выполненными командами было бы неправдой.
+    basalt_put("[shell] /etc/rc: строк: ");
+    basalt_put_u64(commands);
+    basalt_put("\n");
 }
 
 // Размер в байтах. Единица печатается всегда: «12» без неё читалось бы и как
@@ -1125,6 +1275,208 @@ static void cmd_df(int argc, char** argv)
     out_puts("\n");
 }
 
+// --- rz: приём файла по XMODEM ---------------------------------------------
+//
+// Единственное место в шелле, которое читает консоль само: обычно байты
+// забирает главный цикл и отдаёт их tty и редактору. Пока команда работает,
+// цикл стоит в run_command, поэтому договорённость простая - команда владеет
+// консолью целиком. Иначе байты протокола попали бы в строку и стали бы
+// командой, а ACK ушёл бы в файл, если вывод перенаправлен.
+//
+// Запись копится в буфере размером с блок ФС: vfs_write на каждый килобайт
+// пакета - это отдельная запись блока, и файл в сотню килобайт превратился бы
+// в сотню мелких коммитов вместо двадцати пяти крупных.
+
+#define RZ_BUF_SIZE 4096u
+
+static uint8_t s_rz_buf[RZ_BUF_SIZE];
+
+typedef struct {
+    int fd;
+    size_t len;
+    uint32_t written;
+} rz_state;
+
+// Прогресс - только на экран. Поток USB занят протоколом: текст в нём
+// отправитель обязан игнорировать, и проверять это на живом отправителе не
+// стоит. Строка без перевода: следующее обновление затрёт её через \r.
+static void rz_progress(uint32_t written)
+{
+    char num[21];
+    text_puts("\rпринято ");
+    text_puts(basalt_format_u64(num, sizeof(num), written));
+    text_puts(" Б        ");
+    present_dirty();
+}
+
+static bool rz_flush(rz_state* st)
+{
+    if (st->len == 0) {
+        return true;
+    }
+
+    size_t done = 0;
+    while (done < st->len) {
+        uint32_t put = 0;
+        const int rc = vfs_write(st->fd, s_rz_buf + done, (uint32_t)(st->len - done), &put);
+        if (rc != VFS_OK || put == 0) {
+            return false;
+        }
+        done += put;
+    }
+
+    st->written += (uint32_t)st->len;
+    st->len = 0;
+    rz_progress(st->written);
+    return true;
+}
+
+static int rz_sink(void* ctx, const uint8_t* data, size_t len)
+{
+    rz_state* const st = ctx;
+
+    while (len > 0) {
+        const size_t room = RZ_BUF_SIZE - st->len;
+        const size_t n = (len < room) ? len : room;
+        memcpy(s_rz_buf + st->len, data, n);
+        st->len += n;
+        data += n;
+        len -= n;
+
+        if (st->len == RZ_BUF_SIZE && !rz_flush(st)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// Приёмник дошёл до EOT: дописываем буфер. XMODEM зовёт это до ACK, поэтому
+// «передача прошла» и «файл записан» - одно и то же событие.
+static int rz_finish(void* ctx)
+{
+    return rz_flush((rz_state*)ctx) ? 0 : -1;
+}
+
+static int rz_console_put(void* ctx, const uint8_t* data, size_t len)
+{
+    (void)ctx;
+    return (int)basalt_console_write(data, len);
+}
+
+// Ожидание с общим сроком на весь вызов: get зовут один раз на пакет, и он
+// сам решает, сколько ждать. Меньше len означает «срок вышел» - XMODEM
+// ответит NAK и попросит пакет заново.
+static int rz_console_get(void* ctx, uint8_t* data, size_t len, uint32_t timeout_ms)
+{
+    (void)ctx;
+
+    const uint64_t deadline = basalt_uptime_us() + (uint64_t)timeout_ms * 1000u;
+    size_t got = 0;
+
+    for (;;) {
+        got += basalt_console_read(data + got, len - got);
+        if (got >= len || basalt_uptime_us() >= deadline) {
+            break;
+        }
+        basalt_delay_us(100);
+    }
+    return (int)got;
+}
+
+static void rz_drain(void)
+{
+    uint8_t junk[64];
+    while (basalt_console_read(junk, sizeof(junk)) > 0) {
+    }
+}
+
+static void cmd_rz(int argc, char** argv)
+{
+    // Протокол идёт в консоль напрямую, мимо приёмников вывода. Перенаправление
+    // вывода означало бы «ACK писать в файл», ввода - «пакеты читать из
+    // файла»; и то и другое не передача, а недоразумение.
+    //
+    // Проверка раньше argc намеренно: у `rz > /x` аргументов нет, и ответ
+    // «нужно имя файла» увёл бы от настоящей причины.
+    if (s_sink != SINK_SCREEN || s_in_fd >= 0 || s_stdin_pipe) {
+        out_diag("rz: перенаправление ввода-вывода не поддерживается\n");
+        return;
+    }
+
+    if (argc < 2) {
+        out_diag("rz: нужно имя файла\n");
+        return;
+    }
+
+    if (!s_fs_ready) {
+        out_diag("rz: файлы недоступны\n");
+        return;
+    }
+
+    int fd = -1;
+    int rc = vfs_open(argv[1], VFS_O_WRONLY | VFS_O_CREATE | VFS_O_TRUNC, &fd);
+    if (rc != VFS_OK) {
+        out_diag(argv[1]);
+        out_diag(": ");
+        out_fs_error(rc);
+        out_diag("\n");
+        return;
+    }
+
+    // Метка для tools/xsend.py: по ней отправитель понимает, что эхо набранной
+    // команды кончилось и сейчас пойдёт протокол. Человеку с lrzsz она просто
+    // говорит, что плата готова.
+    out_diag("[rz] ждём XMODEM\n");
+
+    // Всё, что успело прийти до приёма (эхо Enter, остатки ввода), выбрасываем:
+    // первый байт пакета не должен оказаться чужой буквой.
+    rz_drain();
+
+    rz_state st;
+    memset(&st, 0, sizeof(st));
+    st.fd = fd;
+
+    xmodem_io io;
+    io.ctx = &st;
+    io.put = rz_console_put;
+    io.get = rz_console_get;
+    io.sink = rz_sink;
+    io.finish = rz_finish;
+
+    const uint64_t started_us = basalt_uptime_us();
+    uint32_t size = 0;
+    rc = xmodem_receive(&io, &size);
+
+    // Буфер дописан внутри приёма (rz_finish), поэтому закрывать можно сразу:
+    // на диске уже всё, что обещал ACK.
+    vfs_close(fd);
+
+    // Строка прогресса осталась без перевода строки.
+    text_putc('\n');
+
+    if (rc != XMODEM_OK) {
+        // Недописанный файл хуже отсутствующего: он выглядит как целый, и
+        // отличить его от целого можно только по размеру, который никто не
+        // помнит. Поэтому после ошибки удаляем - а если не удалось, говорим.
+        const int un = vfs_unlink(argv[1]);
+
+        out_diag("rz: ");
+        out_diag(xmodem_strerror(rc));
+        if (un != VFS_OK) {
+            out_diag("; частичный файл остался: ");
+            out_diag(vfs_strerror(un));
+        }
+        out_diag("\n");
+        return;
+    }
+
+    out_diag("принято ");
+    out_bytes(size);
+    out_diag(" за ");
+    out_u64((basalt_uptime_us() - started_us) / 1000u);
+    out_diag(" мс\n");
+}
+
 static const command s_commands[] = {
     {"help",    cmd_help,    "этот список"},
     {"echo",    cmd_echo,    "напечатать аргументы"},
@@ -1149,6 +1501,7 @@ static const command s_commands[] = {
     {"cp",      cmd_cp,      "скопировать файл"},
     {"mv",      cmd_mv,      "переименовать"},
     {"df",      cmd_df,      "место в ФС"},
+    {"rz",      cmd_rz,      "принять файл по XMODEM"},
 };
 
 static const size_t s_command_count = sizeof(s_commands) / sizeof(s_commands[0]);
@@ -1528,6 +1881,7 @@ void basalt_main(void)
     button_init();
     le_init();
     fs_mount_root();
+    fs_ensure_rc();
 
     out_puts("basalt-os mini\n");
     out_puts("\n");
@@ -1541,6 +1895,11 @@ void basalt_main(void)
     basalt_put(", tty raw, стек ");
     basalt_put_u64(basalt_stack_size());
     basalt_put(" Б\n");
+
+    // /etc/rc выполняется до `ready`: его вывод - часть старта, а не ответ на
+    // команду. Если файл пуст или его нет, строк тут не появится.
+    fs_run_rc();
+
     basalt_put("ready\n\n");
 
     prompt();
