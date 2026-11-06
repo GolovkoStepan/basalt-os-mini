@@ -1,4 +1,4 @@
-// Декодер UTF-8. Зачем отдельный модуль - см. utf8.h.
+// Кодировщик UTF-8. Зачем отдельный модуль - см. utf8.h.
 
 #include "utf8.h"
 
@@ -80,4 +80,38 @@ utf8_status utf8_feed(utf8_decoder* d, uint8_t byte, uint32_t* out)
 
     *out = cp;
     return UTF8_DONE;
+}
+
+size_t utf8_encode(uint32_t cp, char out[4])
+{
+    if (out == NULL) {
+        return 0;
+    }
+    if (cp > CP_MAX) {
+        return 0;
+    }
+    if (cp >= SURROGATE_FIRST && cp <= SURROGATE_LAST) {
+        return 0;
+    }
+
+    if (cp < 0x80u) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800u) {
+        out[0] = (char)(0xC0u | (cp >> 6));
+        out[1] = (char)(0x80u | (cp & 0x3Fu));
+        return 2;
+    }
+    if (cp < 0x10000u) {
+        out[0] = (char)(0xE0u | (cp >> 12));
+        out[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[2] = (char)(0x80u | (cp & 0x3Fu));
+        return 3;
+    }
+    out[0] = (char)(0xF0u | (cp >> 18));
+    out[1] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+    out[2] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+    out[3] = (char)(0x80u | (cp & 0x3Fu));
+    return 4;
 }

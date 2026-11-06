@@ -268,6 +268,25 @@ static void test_margins_filled_with_background(void)
     }
 }
 
+// Курсор рисуется только в своей строке. Проверка не лишняя: полоса строки
+// рисуется независимо, и если подчёркивание считать «всегда», оно появляется
+// в каждой перерисованной строке - при наборе текста экран покрывается
+// чёрточками под первым символом каждой строки.
+static void test_cursor_only_on_its_row(void)
+{
+    text_puts("ab\n");  // курсор уехал на строку 1
+    text_cursor_blink(true);
+
+    render(0);
+    for (int x = 0; x < TEXT_STRIP_W; ++x) {
+        TEST_ASSERT_EQUAL_HEX16(BG, pixel(x, TEXT_CELL_H - 1));
+    }
+
+    render(1);
+    const int x = cell_x(0);
+    TEST_ASSERT_EQUAL_HEX16(FG, pixel(x, TEXT_CELL_H - 1));
+}
+
 // --- кириллица и UTF-8 ---
 
 // Два байта UTF-8 - один символ и одна клетка. Если бы клетка считалась на
@@ -431,6 +450,8 @@ int main(void)
     RUN_TEST(test_space_draws_nothing);
     RUN_TEST(test_glyph_bit_order);
     RUN_TEST(test_margins_filled_with_background);
+
+    RUN_TEST(test_cursor_only_on_its_row);
 
     RUN_TEST(test_cyrillic_takes_one_cell);
     RUN_TEST(test_cyrillic_glyph_drawn);

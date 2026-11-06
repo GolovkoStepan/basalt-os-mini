@@ -26,7 +26,7 @@ basalt-os-mini/
 ├── README.md            что за система и почему
 ├── Makefile             короткие имена команд: make help
 ├── .clangd              пути xtensa-тулчейна
-├── platformio.ini       [base] + env: tdisplay, tdisplay-panic, probe, lcd, text, bare, bare-panic, console, hello, bringup, native
+├── platformio.ini       [base] + env: tdisplay, tdisplay-panic, probe, lcd, text, tty, bare, bare-panic, console, hello, bringup, native
 ├── boards/
 │   ├── tdisplay_s3/     board_pins.h основной платы
 │   └── cardputer/       board_pins.h Cardputer (уезжает в capsh)
@@ -41,8 +41,9 @@ basalt-os-mini/
 ├── tools/               serial-read, flash-backup, check-image, smoke, reset, make_font
 ├── test/                хостовые тесты (Unity), по каталогу на модуль
 ├── src/                 точки входа env'ов + CMakeLists с выбором платы
-├── drivers/             периферия под своим интерфейсом (lcd.h → lcd_i80.c)
+├── drivers/             периферия под своим интерфейсом: lcd.h → lcd_i80.c, button.h → button_gpio.c
 ├── text/                текстовая матрица 53×17, UTF-8 и сгенерированный шрифт
+├── tty/                 line discipline: канон и raw, эхо, Backspace, Ctrl-C/D
 └── arch/xtensa/         старт, куча, векторы, паника, консоль, тик, индикатор
 ```
 
@@ -264,6 +265,15 @@ pyserial из PlatformIO). Иначе порт просто не откроет�
   состояние разбора (`text/utf8.c`) живёт между вызовами `text_putc`. Клетка
   матрицы — `uint16_t` с code point, не байт: иначе «Ж» пришлось бы хранить
   двумя клетками. Новый поток символов — свой декодер, а не общий.
+- **Line discipline не знает про экран и USB.** `tty/tty.c` принимает байты и
+  отдаёт события (`CHAR`, `ERASE`, `LINE`, `INTR`, `EOF`, `BELL`), а рисует и
+  передаёт программе вызывающий. Поэтому набор текста проверяется на маке
+  (`test/test_tty`), а `src/tty/main.c` остаётся тонкой связкой. `Backspace`
+  откатывает **целый UTF-8-символ**, а не байт: иначе от «Ж» осталась бы
+  половина последовательности, и следующая буква склеилась бы с ней.
+- **Кнопка — событие, а не пин.** `drivers/button.h` (`button_down(BUTTON_…)`)
+  прячет полярность и подтяжку; приложение не должно знать, что G0 замыкается
+  на землю. Антидребезг живёт у вызывающего: он зависит от частоты опроса.
 - Отступ — 4 пробела в C/C++, 2 в YAML/JSON/Markdown-таблицах.
 - В git **не попадают**: `.pio/`, `compile_commands.json` (абсолютные пути),
   `.cache/`, `logs/`, `backup/*.bin`, `__pycache__/`, `.DS_Store`.
@@ -380,6 +390,9 @@ newlib** — clangd находит его по старой привычке и 
 | Сборка **любого** env падает на `pydantic-core` / `No module named 'idf_component_manager'`, CMake ругается на `project()` | PlatformIO на Python 3.15 пересоздал окружение IDF, а собрать в него зависимости не смог | PIO на Python ≤ 3.14 через `~/.venvs/pio314`, см. раздел 3 |
 | `pio run` собирает не тот env | `default_envs` теперь `tdisplay` | явно `-e bare` для Cardputer |
 | Правка `sdkconfig.defaults` не подействовала | PlatformIO держит рядом готовый `sdkconfig.<env>` и копирует defaults только если тот старше | удалить `sdkconfig.<env>` (в `.gitignore`) и пересобрать |
+| `Could not open /dev/cu.usbmodem…: port is busy` при заливке | порт держит открытый `pio device monitor`; `serial-read.sh` держит его только пока читает | закрыть монитор и повторить заливку |
+| `Ctrl-C` в `pio device monitor` закрывает монитор, а плата не реагирует | байт `0x03` перехватывает сам монитор, до USB-JTAG он не доходит | кнопка **G0** (в `env:tty` она отдаёт `Ctrl-C`) или `screen /dev/cu.usbmodem… 115200`, где `^C` проходит |
+| При наборе текста чёрточки под первым символом каждой строки | курсор рисовался в полосе любой перерисовываемой строки, а не только своей | `row == s_row` в `text_render_row`; тест `test_cursor_only_on_its_row` |
 | `Warning! Flash memory size mismatch detected. Expected 16MB, found 2MB!` на каждой сборке espidf | `board_build.flash_size` в `platformio.ini` для espidf задаёт только загрузку; размер в образе и таблице разделов берётся из `CONFIG_ESPTOOLPY_FLASHSIZE` в `sdkconfig.<env>`, а там дефолт IDF — 2 МБ | сейчас безвредно (приложение в 1 МБ, весь образ 182 КБ). Станет важно на A9: под ФС нужен `CONFIG_ESPTOOLPY_FLASHSIZE_16MB` в `sdkconfig.defaults` и своя таблица разделов. Флеш физически 16 МБ — это проверено (`docs/board.md` §10 п.1) |
 | `lvalue required as left operand of assignment` на `GPIO_OUT1_W1TS_REG = …` | в IDF это адрес регистра, а не переменная | `REG_WRITE(GPIO_OUT1_W1TS_REG, …)`; то же для `SET_PERI_REG_*` |
 | Изображение на экране — дополнение до белого (синее жёлтым) | стекло IPS требует `INVON` | `DISP_INVERT_COLORS = 1` в `board_pins.h`, подробности — `docs/board.md` §4 |

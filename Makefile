@@ -24,7 +24,7 @@ PIO ?= pio
 
 # Список env для verify. Должен совпадать с .github/workflows/build.yml:
 # сломанный env, который собирается только вручную, обнаруживают через неделю.
-ENVS ?= tdisplay tdisplay-panic probe lcd text console hello bringup bare bare-panic
+ENVS ?= tdisplay tdisplay-panic probe lcd text tty console hello bringup bare bare-panic
 
 # Порт нужен, только если в системе больше одной платы.
 PORT_ARG = $(if $(PORT),--upload-port $(PORT),)

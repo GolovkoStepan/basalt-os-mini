@@ -19,7 +19,7 @@ tty, свой шелл. Без Arduino и без FreeRTOS.
 | **Что умеет** | [`docs/FUNCTIONALITY.md`](docs/FUNCTIONALITY.md) |
 | **Порядок работ** | [`docs/ROADMAP.md`](docs/ROADMAP.md) |
 | **Что сделано и почему** | [`docs/JOURNAL.md`](docs/JOURNAL.md) |
-| **Состояние** | A0 закрыта и перенесена на T-Display-S3: своя точка входа, своя консоль, своё время, своя паника, своя таблица векторов и своя карта памяти работают. Проба пройдена 06.11.2026: PSRAM есть (8 МБ OCT), кадровый буфер помещается. Дальше — A1, экран |
+| **Состояние** | A0–A2 закрыты (06.11.2026): своя точка входа, консоль, время, паника, таблица векторов и карта памяти; текст 53×17 с кириллицей и прокруткой; ввод с мака через `tty` (канон и raw, `Backspace` по UTF-8, зеркало в USB, G0 как `Ctrl-C`). Дальше — A3, шелл |
 
 ## Плата, на которую проект переехал
 
@@ -157,11 +157,12 @@ basalt-os-mini/
 ├── AGENTS.md                правила этого репозитория
 ├── Makefile                 короткие имена команд: make help
 ├── .clangd                  пути xtensa-тулчейна
-├── platformio.ini           [base] + env: tdisplay, tdisplay-panic, probe, lcd, text, bare, bare-panic, console, hello, bringup, native
+├── platformio.ini           [base] + env: tdisplay, tdisplay-panic, probe, lcd, text, tty, bare, bare-panic, console, hello, bringup, native
 ├── ld/memory.ld             карта памяти приложения (своя, не из IDF)
 ├── boards/tdisplay_s3/      board_pins.h основной платы
 ├── boards/cardputer/        board_pins.h Cardputer (уезжает в capsh)
 ├── docs/
+├── tty/                     line discipline: канон и raw, эхо, Backspace, Ctrl-C/D
 ├── tools/                   serial-read, flash-backup, check-image, smoke, reset
 ├── test/                    хостовые тесты (Unity)
 ├── src/                     точки входа env'ов + CMakeLists с выбором платы

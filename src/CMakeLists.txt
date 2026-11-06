@@ -27,9 +27,9 @@ else()
     set(BASALT_LCD_SRC       "")
 endif()
 
-# Приложение тоже выбирается сборкой: env:probe, env:lcd и env:text - тот же
-# старт и та же консоль, но другой main.c. Второй копии arch/ при этом не
-# появляется, и ни один общий файл не обрастает ветвлениями «а в щупе иначе»:
+# Приложение тоже выбирается сборкой: env:probe, env:lcd, env:text и env:tty -
+# тот же старт и та же консоль, но другой main.c. Второй копии arch/ при этом
+# не появляется, и ни один общий файл не обрастает ветвлениями «а в щупе иначе»:
 # различие ровно в одном файле.
 #
 # Текстовая матрица подключается только текстовому env. В env:bare её файлы не
@@ -37,6 +37,9 @@ endif()
 # с другим env ничего не должна менять в уже работающей прошивке.
 set(BASALT_TEXT_SRC "")
 set(BASALT_TEXT_INC "")
+set(BASALT_TTY_SRC "")
+set(BASALT_TTY_INC "")
+set(BASALT_BUTTON_SRC "")
 
 if(BASALT_APP_PROBE)
     set(BASALT_APP_SRC "probe/main.c")
@@ -50,6 +53,20 @@ elseif(BASALT_APP_TEXT)
         "../text/font_5x7.c"
     )
     set(BASALT_TEXT_INC "../text")
+elseif(BASALT_APP_TTY)
+    # Ввод: та же матрица плюс line discipline и кнопки. Кнопки только здесь:
+    # в env:text и env:bare они не нужны, а проверенную сборку A0 незачем
+    # увеличивать мёртвым кодом.
+    set(BASALT_APP_SRC "tty/main.c")
+    set(BASALT_TEXT_SRC
+        "../text/matrix.c"
+        "../text/utf8.c"
+        "../text/font_5x7.c"
+    )
+    set(BASALT_TEXT_INC "../text")
+    set(BASALT_TTY_SRC "../tty/tty.c")
+    set(BASALT_TTY_INC "../tty")
+    set(BASALT_BUTTON_SRC "../drivers/button_gpio.c")
 else()
     set(BASALT_APP_SRC "bare/main.c")
 endif()
@@ -69,9 +86,12 @@ idf_component_register(
         "../arch/xtensa/heap.c"
         ${BASALT_LCD_SRC}
         ${BASALT_TEXT_SRC}
+        ${BASALT_TTY_SRC}
+        ${BASALT_BUTTON_SRC}
     INCLUDE_DIRS
         "../arch/xtensa/include"
         "../drivers"
         ${BASALT_BOARD_DIR}
         ${BASALT_TEXT_INC}
+        ${BASALT_TTY_INC}
 )

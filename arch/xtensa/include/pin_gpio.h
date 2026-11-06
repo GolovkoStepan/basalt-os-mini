@@ -1,4 +1,5 @@
-// Работа с пином как с обычным выходом - по регистрам, без driver/gpio.
+// Работа с пином как с обычным входом или выходом - по регистрам, без
+// driver/gpio.
 //
 // Зачем отдельный файл: на ESP32-S3 пины 0..31 и 32..48 живут в разных наборах
 // регистров (GPIO_* и GPIO_*1), и одним сдвигом на 38 бит нужный бит не
@@ -53,4 +54,39 @@ static inline void pin_gpio_output(unsigned pin, bool level)
         SET_PERI_REG_MASK(GPIO_ENABLE1_W1TS_REG, bit);
     }
     pin_gpio_write(pin, level);
+}
+
+// Сделать пином-входом. Подтяжка задаётся здесь же, а не отдельным вызовом:
+// пин без подтяжки «висит в воздухе» и читается случайно, а кнопка на этой
+// плате как раз замыкает пин на землю - в покое его надо держать в единице.
+static inline void pin_gpio_input(unsigned pin, bool pullup)
+{
+    const uint32_t bit = 1u << (pin & 31u);
+    pin_as_gpio(pin);
+
+    const uint32_t reg = GPIO_PIN_MUX_REG[pin];
+    if (reg != 0) {
+        SET_PERI_REG_MASK(reg, FUN_IE);
+        if (pullup) {
+            SET_PERI_REG_MASK(reg, FUN_PU);
+        } else {
+            CLEAR_PERI_REG_MASK(reg, FUN_PU);
+        }
+        CLEAR_PERI_REG_MASK(reg, FUN_PD);
+    }
+
+    // Выключить выход, иначе пин будет сам себе подавать уровень.
+    if (pin < 32) {
+        CLEAR_PERI_REG_MASK(GPIO_ENABLE_W1TC_REG, bit);
+    } else {
+        CLEAR_PERI_REG_MASK(GPIO_ENABLE1_W1TC_REG, bit);
+    }
+}
+
+// Прочитать уровень на пине. Пины 0..31 и 32..48 - разные регистры, отсюда
+// две ветки, как и у записи.
+static inline bool pin_gpio_read(unsigned pin)
+{
+    const uint32_t bits = (pin < 32) ? REG_READ(GPIO_IN_REG) : REG_READ(GPIO_IN1_REG);
+    return ((bits >> (pin & 31u)) & 1u) != 0;
 }

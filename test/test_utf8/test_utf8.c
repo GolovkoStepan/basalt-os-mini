@@ -187,6 +187,76 @@ static void test_reset_drops_pending(void)
     TEST_ASSERT_EQUAL_INT(UTF8_INVALID, utf8_feed(&s_dec, 0x90, &s_out));
 }
 
+// --- кодировщик ---
+
+// Простой случай: ASCII кодируется одним байтом, и это тот же байт.
+static void test_encode_ascii_one_byte(void)
+{
+    char out[4] = {0, 0, 0, 0};
+    TEST_ASSERT_EQUAL_INT(1, (int)utf8_encode('A', out));
+    TEST_ASSERT_EQUAL_HEX8('A', (uint8_t)out[0]);
+}
+
+// Кириллица - два байта. Сверяем с тем, что приходит из терминала: если
+// кодировщик и декодер разойдутся, эхо покажет не ту букву, а искать причину
+// будут в драйвере USB.
+static void test_encode_cyrillic_two_bytes(void)
+{
+    char out[4] = {0, 0, 0, 0};
+    TEST_ASSERT_EQUAL_INT(2, (int)utf8_encode(0x0416, out));  // «Ж»
+    TEST_ASSERT_EQUAL_HEX8(0xD0, (uint8_t)out[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x96, (uint8_t)out[1]);
+}
+
+// Границы разрядности: 0x7F/0x80 и 0x7FF/0x800 - там меняется длина записи.
+static void test_encode_length_boundaries(void)
+{
+    char out[4];
+
+    TEST_ASSERT_EQUAL_INT(1, (int)utf8_encode(0x7F, out));
+    TEST_ASSERT_EQUAL_INT(2, (int)utf8_encode(0x80, out));
+    TEST_ASSERT_EQUAL_INT(2, (int)utf8_encode(0x7FF, out));
+    TEST_ASSERT_EQUAL_INT(3, (int)utf8_encode(0x800, out));
+    TEST_ASSERT_EQUAL_INT(3, (int)utf8_encode(0xFFFF, out));
+    TEST_ASSERT_EQUAL_INT(4, (int)utf8_encode(0x10000, out));
+    TEST_ASSERT_EQUAL_INT(4, (int)utf8_encode(0x10FFFF, out));
+}
+
+// Главное свойство: что закодировали, то и разобрали. Проверяется на наборе,
+// где есть все четыре длины, - именно так ошибка в сдвиге и вылезет.
+static void test_encode_feed_roundtrip(void)
+{
+    static const uint32_t kCodes[] = {
+        'A', 0x7F, 0x80, 0x0416, 0x044F, 0x0401, 0x20AC, 0x1F600, 0x10FFFF,
+    };
+
+    for (size_t i = 0; i < sizeof(kCodes) / sizeof(kCodes[0]); ++i) {
+        char out[4];
+        const size_t n = utf8_encode(kCodes[i], out);
+        TEST_ASSERT_TRUE(n > 0);
+
+        utf8_reset(&s_dec);
+        utf8_status st = UTF8_PENDING;
+        for (size_t b = 0; b < n; ++b) {
+            st = utf8_feed(&s_dec, (uint8_t)out[b], &s_out);
+        }
+        TEST_ASSERT_EQUAL_INT(UTF8_DONE, st);
+        TEST_ASSERT_EQUAL_HEX32(kCodes[i], s_out);
+    }
+}
+
+// То, что нельзя закодировать, кодировщик отвергает так же, как декодер:
+// суррогаты и выход за 0x10FFFF.
+static void test_encode_rejects_invalid(void)
+{
+    char out[4];
+
+    TEST_ASSERT_EQUAL_INT(0, (int)utf8_encode(0xD800, out));
+    TEST_ASSERT_EQUAL_INT(0, (int)utf8_encode(0xDFFF, out));
+    TEST_ASSERT_EQUAL_INT(0, (int)utf8_encode(0x110000, out));
+    TEST_ASSERT_EQUAL_INT(0, (int)utf8_encode(0xFFFFFFFFu, out));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -211,6 +281,12 @@ int main(void)
 
     RUN_TEST(test_state_survives_calls);
     RUN_TEST(test_reset_drops_pending);
+
+    RUN_TEST(test_encode_ascii_one_byte);
+    RUN_TEST(test_encode_cyrillic_two_bytes);
+    RUN_TEST(test_encode_length_boundaries);
+    RUN_TEST(test_encode_feed_roundtrip);
+    RUN_TEST(test_encode_rejects_invalid);
 
     return UNITY_END();
 }
