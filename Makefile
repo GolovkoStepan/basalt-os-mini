@@ -24,13 +24,13 @@ PIO ?= pio
 
 # Список env для verify. Должен совпадать с .github/workflows/build.yml:
 # сломанный env, который собирается только вручную, обнаруживают через неделю.
-ENVS ?= tdisplay tdisplay-panic console hello bringup bare bare-panic
+ENVS ?= tdisplay tdisplay-panic probe console hello bringup bare bare-panic
 
 # Порт нужен, только если в системе больше одной платы.
 PORT_ARG = $(if $(PORT),--upload-port $(PORT),)
 
 .PHONY: all help build flash log monitor test check verify smoke compiledb \
-        reset erase clean id backup devices
+        reset erase clean id backup devices probe
 
 all: build
 
@@ -63,6 +63,10 @@ verify: ## то же, что CI: тесты, сборка всех env, пров
 
 smoke: ## залить ENV и сверить лог с «признаком успеха» (плата нужна)
 	./tools/smoke.sh $(ENV)
+
+probe: ## залить щуп и прочитать замеры PSRAM (плата нужна)
+	$(PIO) run -e probe -t upload $(PORT_ARG)
+	./tools/serial-read.sh $(SECONDS)
 
 compiledb: ## база для clangd под ENV; под другую env - отдельным вызовом
 	$(PIO) run -e $(ENV) -t compiledb

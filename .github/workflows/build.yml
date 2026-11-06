@@ -102,7 +102,7 @@ jobs:
       # all envs, а не default_envs: сломанный env, который собирается только
       # вручную, узнаётся об этом через неделю.
       - name: собрать все env
-        run: pio run -e tdisplay -e tdisplay-panic -e console -e hello -e bringup -e bare -e bare-panic
+        run: pio run -e tdisplay -e tdisplay-panic -e probe -e console -e hello -e bringup -e bare -e bare-panic
 
       # Обещания A0, которые сборка молча не проверяет: наша карта памяти,
       # выравнивание таблицы векторов, границы кучи. Обе платы: карта памяти

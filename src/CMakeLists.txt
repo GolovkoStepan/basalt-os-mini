@@ -25,9 +25,18 @@ else()
     set(BASALT_BOARD_DIR     "../boards/cardputer")
 endif()
 
+# Приложение тоже выбирается сборкой: env:probe - тот же старт и та же консоль,
+# но другой main.c. Второй копии arch/ при этом не появляется, и ни один общий
+# файл не обрастает ветвлениями «а в щупе иначе»: различие ровно в одном файле.
+if(BASALT_APP_PROBE)
+    set(BASALT_APP_SRC "probe/main.c")
+else()
+    set(BASALT_APP_SRC "bare/main.c")
+endif()
+
 idf_component_register(
     SRCS
-        "bare/main.c"
+        ${BASALT_APP_SRC}
         "../arch/xtensa/console_usb_jtag.c"
         "../arch/xtensa/tick.c"
         ${BASALT_INDICATOR_SRC}

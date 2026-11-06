@@ -18,3 +18,28 @@ CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 ; несколько секунд. На A0 он не нужен: тик у нас свой, а ложные паники
 ; маскируют настоящие.
 CONFIG_ESP_TASK_WDT_EN=n
+
+; PSRAM - 8 МБ Octal на T-Display-S3 (S3R8). Нужна вехе A1: кадровый буфер
+; 320x170x2 = 108.8 КБ в SRAM рядом с ядром не помещается, а в PSRAM влезает
+; целиком (docs/FUNCTIONALITY.md, раздел 13).
+;
+; Включение идёт здесь, а не в board-файле: board-файл PlatformIO описывает
+; flash и режим загрузки, а PSRAM - это конфиг IDF. До этого CONFIG_SPIRAM не
+; был задан вообще, то есть 8 МБ существовали в даташите и были недоступны из
+; кода (видно в .pio/build/tdisplay/config/sdkconfig.h).
+;
+; CONFIG_SPIRAM_IGNORE_NOTFOUND - потому что файл общий на обе espidf-платы,
+; а у Cardputer (env:bare, bare-panic) PSRAM физически нет: без этого флага
+; esp_psram_chip_init() на её старте делает abort(), то есть плата не
+; поднимается вовсе. С флагом она пишет в лог «Failed to init external RAM»
+; и работает дальше, как раньше. Когда env:bare уедет в capsh вместе с
+; платой, флаг убрать: честнее падать, если PSRAM не нашлась.
+;
+; Отдельного sdkconfig для tdisplay нет вынужденно: PlatformIO 6.2 читает
+; только sdkconfig.defaults, а разделитель списка «;» в platformio.ini - это
+; начало комментария, поэтому -DSDKCONFIG_DEFAULTS=файл1;файл2 не задать.
+; Проверено по ~/.platformio/platforms/espressif32/builder/frameworks/espidf.py.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
