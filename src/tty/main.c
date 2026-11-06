@@ -340,11 +340,18 @@ static void draw_header(void)
 
 void basalt_main(void)
 {
-    // Порядок как в остальных env: консоль первой - если что-то ниже зависнет,
-    // след останется в логе; пауза до вывода, чтобы хост открыл порт; векторы
-    // до работы с периферией.
+    // Порядок: консоль первая; экран до паузы, чтобы на нём не висел кадр
+    // прошлой сессии (панель хранит его в своей памяти, пока не затрут);
+    // векторы после паузы - их отчёт печатается, а хост ещё не открыл порт.
+    // Подробнее - в src/shell/main.c.
     basalt_console_init();
     basalt_tick_init();
+
+    lcd_init();
+    lcd_backlight(true);
+    text_init();
+    present_dirty();
+
     basalt_delay_us(2000000);
     basalt_vectors_init();
 
@@ -352,9 +359,6 @@ void basalt_main(void)
 
     basalt_put("\n\nbasalt-os tty\n");
 
-    lcd_init();
-    lcd_backlight(true);
-    text_init();
     tty_init();
     button_init();
 

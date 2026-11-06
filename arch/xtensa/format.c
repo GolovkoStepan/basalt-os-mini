@@ -64,3 +64,21 @@ void basalt_put_sec3(uint64_t us)
     buf[3] = '\0';
     basalt_put(buf);
 }
+
+// Округление к ближайшему, а не усечение. Разница видна сразу: 3 КБ из 346 -
+// это 0.87%, и «0%» читалось бы как «ничего не занято», хотя занято. Половина
+// прибавляется к числителю до деления - так формула остаётся целочисленной.
+//
+// Считается в 64 битах: part * 100 на 32-битном size_t переполнилось бы уже
+// на 43 МБ, а в PSRAM их восемь.
+const char* basalt_format_percent(char* buf, size_t cap, uint64_t part, uint64_t total)
+{
+    if (total == 0) {
+        buf[0] = '0';
+        buf[1] = '\0';
+        return buf;
+    }
+
+    const uint64_t pct = (part * 100u + total / 2u) / total;
+    return basalt_format_u64(buf, cap, pct);
+}

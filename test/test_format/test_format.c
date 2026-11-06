@@ -160,6 +160,69 @@ static void test_sequence_matches_panic_line(void)
     TEST_ASSERT_EQUAL_STRING("EPC1     0x42001462", console_stub_text());
 }
 
+// --- проценты ---
+
+// Возвращает строку в переданном буфере, а не печатает: так же устроен
+// basalt_format_u64, и вызывающий сам решает, куда её девать.
+static const char* pct(uint64_t part, uint64_t total)
+{
+    static char buf[8];
+    return basalt_format_percent(buf, sizeof(buf), part, total);
+}
+
+// Деления на ноль быть не должно: у пустой области процента нет, но напечатать
+// что-то надо. Ноль - самое честное из чисел.
+static void test_percent_zero_total(void)
+{
+    TEST_ASSERT_EQUAL_STRING("0", pct(0, 0));
+    TEST_ASSERT_EQUAL_STRING("0", pct(123, 0));
+}
+
+// Округление к ближайшему: 3 КБ из 346 - это 0.87%, и «0%» читалось бы как
+// «память не занята». Именно это округление и есть причина завести функцию.
+static void test_percent_rounds_not_truncates(void)
+{
+    TEST_ASSERT_EQUAL_STRING("1", pct(3, 346));
+    TEST_ASSERT_EQUAL_STRING("1", pct(5, 1000));
+}
+
+// Границы: пусто, всё, почти всё.
+static void test_percent_edges(void)
+{
+    TEST_ASSERT_EQUAL_STRING("0", pct(0, 100));
+    TEST_ASSERT_EQUAL_STRING("100", pct(100, 100));
+    TEST_ASSERT_EQUAL_STRING("50", pct(50, 100));
+    TEST_ASSERT_EQUAL_STRING("100", pct(8192, 8192));
+}
+
+// 0.5 и больше округляется вверх, меньше - вниз: половина прибавляется до
+// деления, поэтому ровно 0.5 идёт вверх.
+static void test_percent_halves(void)
+{
+    TEST_ASSERT_EQUAL_STRING("50", pct(1, 2));
+    TEST_ASSERT_EQUAL_STRING("33", pct(1, 3));
+    TEST_ASSERT_EQUAL_STRING("67", pct(2, 3));
+    TEST_ASSERT_EQUAL_STRING("1", pct(1, 200));
+}
+
+// Настоящие числа с платы: стек 992 из 8192 и куча PSRAM 8189 из 8192.
+static void test_percent_board_values(void)
+{
+    TEST_ASSERT_EQUAL_STRING("12", pct(992, 8192));
+    TEST_ASSERT_EQUAL_STRING("99", pct(343, 346));
+    TEST_ASSERT_EQUAL_STRING("100", pct(8189, 8192));
+}
+
+// part * 100 переполнило бы 32-битный size_t уже на 43 МБ, а в PSRAM их восемь.
+// Проверка держит формулу в 64 битах при значениях, которые реально бывают.
+static void test_percent_large_values(void)
+{
+    TEST_ASSERT_EQUAL_STRING("50", pct(1u << 22, 1u << 23));      // 4 МБ из 8 МБ
+    TEST_ASSERT_EQUAL_STRING("100", pct(1u << 23, 1u << 23));
+    // 1.56% - округление вверх до 2, а не усечение до 1.
+    TEST_ASSERT_EQUAL_STRING("2", pct(1u << 17, 1u << 23));
+}
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -181,5 +244,11 @@ int main(int argc, char** argv)
     RUN_TEST(test_sec3_milliseconds_are_truncated);
     RUN_TEST(test_sec3_large_uptime);
     RUN_TEST(test_sequence_matches_panic_line);
+    RUN_TEST(test_percent_zero_total);
+    RUN_TEST(test_percent_rounds_not_truncates);
+    RUN_TEST(test_percent_edges);
+    RUN_TEST(test_percent_halves);
+    RUN_TEST(test_percent_board_values);
+    RUN_TEST(test_percent_large_values);
     return UNITY_END();
 }

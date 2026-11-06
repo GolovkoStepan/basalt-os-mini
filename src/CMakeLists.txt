@@ -40,6 +40,8 @@ set(BASALT_TEXT_INC "")
 set(BASALT_TTY_SRC "")
 set(BASALT_TTY_INC "")
 set(BASALT_BUTTON_SRC "")
+set(BASALT_SHELL_SRC "")
+set(BASALT_SHELL_INC "")
 
 if(BASALT_APP_PROBE)
     set(BASALT_APP_SRC "probe/main.c")
@@ -67,6 +69,26 @@ elseif(BASALT_APP_TTY)
     set(BASALT_TTY_SRC "../tty/tty.c")
     set(BASALT_TTY_INC "../tty")
     set(BASALT_BUTTON_SRC "../drivers/button_gpio.c")
+elseif(BASALT_APP_SHELL)
+    # Шелл: тот же экран и тот же tty, что в env:tty, плюс правка строки,
+    # история и разбор. Веткой, а не флагом в общем main.c: у env:tty остаётся
+    # свой маленький main, и его проверенная сборка не растёт от шелла.
+    set(BASALT_APP_SRC "shell/main.c")
+    set(BASALT_TEXT_SRC
+        "../text/matrix.c"
+        "../text/utf8.c"
+        "../text/font_5x7.c"
+    )
+    set(BASALT_TEXT_INC "../text")
+    set(BASALT_TTY_SRC "../tty/tty.c")
+    set(BASALT_TTY_INC "../tty")
+    set(BASALT_BUTTON_SRC "../drivers/button_gpio.c")
+    set(BASALT_SHELL_SRC
+        "../shell/parse.c"
+        "../shell/history.c"
+        "../shell/lineedit.c"
+    )
+    set(BASALT_SHELL_INC "../shell")
 else()
     set(BASALT_APP_SRC "bare/main.c")
 endif()
@@ -84,14 +106,17 @@ idf_component_register(
         "../arch/xtensa/start.c"
         "../arch/xtensa/start.S"
         "../arch/xtensa/heap.c"
+        "../arch/xtensa/stack.c"
         ${BASALT_LCD_SRC}
         ${BASALT_TEXT_SRC}
         ${BASALT_TTY_SRC}
         ${BASALT_BUTTON_SRC}
+        ${BASALT_SHELL_SRC}
     INCLUDE_DIRS
         "../arch/xtensa/include"
         "../drivers"
         ${BASALT_BOARD_DIR}
         ${BASALT_TEXT_INC}
         ${BASALT_TTY_INC}
+        ${BASALT_SHELL_INC}
 )

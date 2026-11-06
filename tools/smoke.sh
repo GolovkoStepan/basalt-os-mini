@@ -38,6 +38,16 @@ case "$ENV" in
             'tick 20'
         )
         ;;
+    shell)
+        # Шелл: строка приглашения в логе и признак «система жива». Читаем
+        # дольше tdisplay не нужно: паники здесь нет, а тики проверяет
+        # tdisplay - шелл использует тот же старт.
+        READ_SECONDS=10
+        PATTERNS=(
+            '[shell] экран'
+            'ready'
+        )
+        ;;
     tdisplay-panic|bare-panic)
         # Падение на 5-й секунде, отчёт, пауза 3 с, сброс. Меньше 14 с читать
         # нельзя: не увидим ни паники, ни причины сброса.
@@ -63,7 +73,7 @@ case "$ENV" in
     # проходит через раз, хуже отсутствия проверки. Заодно после заливки hello
     # чип перестал отвечать esptool до ручного G0 - см. docs/board.md, грабли.
     *)
-        echo "не знаю env '$ENV'. Есть: tdisplay, tdisplay-panic, bare, bare-panic, console" >&2
+        echo "не знаю env '$ENV'. Есть: tdisplay, tdisplay-panic, shell, bare, bare-panic, console" >&2
         exit 1
         ;;
 esac

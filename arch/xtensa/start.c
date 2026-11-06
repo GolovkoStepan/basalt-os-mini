@@ -5,6 +5,7 @@
 #include "start.h"
 
 #include "heap.h"
+#include "stack.h"
 
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
@@ -59,6 +60,10 @@ void basalt_start_c(void) __attribute__((noreturn));
 
 void basalt_start_c(void)
 {
+    // Закраска стека - самой первой: всё, что успеет поработать до неё, в
+    // отчёт «сколько занято» не попадёт, и мы получили бы заниженные цифры.
+    basalt_stack_paint();
+
     // Куча - до всего остального: любой драйвер выделяет память. Забыть этот
     // вызов легко: без него код собирается, а падает потом и в другом месте.
     basalt_heap_init();

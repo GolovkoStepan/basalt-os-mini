@@ -8,10 +8,14 @@
 
     .section .bss.basalt_stack, "aw", @nobits
     .align  16
+    // Границы объявлены глобальными: по ним arch/xtensa/stack.c закрашивает
+    // свободную часть и потом считает, сколько стека занято (команда top).
+    .global basalt_stack_bottom
 basalt_stack_bottom:
     // 8 КБ. Самый жадный пользователь - паника: она печатает дамп через
     // свою же консоль, и на этот путь уходит несколько сотен байт.
     .space  8192
+    .global basalt_stack_top
 basalt_stack_top:
 
     .section .text.basalt_start, "ax"

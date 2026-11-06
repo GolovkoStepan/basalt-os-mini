@@ -71,6 +71,58 @@ static void test_canon_lf_also_finishes_line(void)
     TEST_ASSERT_EQUAL_STRING("echo", tty_line());
 }
 
+// CR+LF - это одно нажатие Enter, а не два. Проверено на живой плате: `pio
+// device monitor` в режиме EOL=CRLF шлёт оба байта, и без склейки каждая
+// команда выполнялась дважды - вторая пустая, - а на экране после ответа
+// появлялась лишняя строка с приглашением.
+static void test_canon_crlf_is_one_enter(void)
+{
+    feed("echo");
+    TEST_ASSERT_EQUAL_INT(TTY_EV_LINE, tty_input('\r').event);
+    TEST_ASSERT_EQUAL_INT(TTY_EV_NONE, tty_input('\n').event);
+    TEST_ASSERT_EQUAL_STRING("echo", tty_line());
+}
+
+// Съеденный LF не должен испортить следующую строку: она начинается с нуля,
+// как после обычного Enter.
+static void test_canon_crlf_next_line_clean(void)
+{
+    feed("one");
+    tty_input('\r');
+    tty_input('\n');
+
+    tty_input('t');
+    TEST_ASSERT_EQUAL_INT(1, (int)tty_pending_len());
+    TEST_ASSERT_EQUAL_STRING("t", tty_pending());
+}
+
+// Признак «был CR» не должен глушить обычную букву: LF съедаем только
+// непосредственно за CR.
+static void test_canon_cr_then_letter_not_swallowed(void)
+{
+    tty_input('\r');
+    const tty_result r = tty_input('a');
+    TEST_ASSERT_EQUAL_INT(TTY_EV_CHAR, r.event);
+    TEST_ASSERT_EQUAL_HEX32('a', r.cp);
+}
+
+// Одиночный LF без предшествующего CR остаётся Enter: скрипты и другие
+// терминалы шлют именно его.
+static void test_canon_lf_alone_still_enter(void)
+{
+    feed("x");
+    TEST_ASSERT_EQUAL_INT(TTY_EV_LINE, tty_input('\n').event);
+    TEST_ASSERT_EQUAL_INT(TTY_EV_LINE, tty_input('\n').event);
+}
+
+// Два CR подряд - это два Enter, а не один: склейка касается только пары
+// CR+LF, иначе быстрое нажатие Enter терялось бы.
+static void test_canon_two_crs_two_lines(void)
+{
+    TEST_ASSERT_EQUAL_INT(TTY_EV_LINE, tty_input('\r').event);
+    TEST_ASSERT_EQUAL_INT(TTY_EV_LINE, tty_input('\r').event);
+}
+
 // Эхо: каждый печатный байт даёт CHAR с этим же кодом - приложение по нему
 // рисует символ.
 static void test_canon_echo_per_char(void)
@@ -189,6 +241,19 @@ static void test_raw_cr_is_plain_byte(void)
     TEST_ASSERT_EQUAL_HEX32('\r', r.cp);
 }
 
+// В raw CR+LF тоже одно нажатие: шелл получает один Enter, а не два, иначе
+// каждая команда выполнялась бы дважды (второй раз - пустая).
+static void test_raw_crlf_is_one_enter(void)
+{
+    tty_set_mode(TTY_MODE_RAW);
+
+    const tty_result cr = tty_input('\r');
+    TEST_ASSERT_EQUAL_INT(TTY_EV_CHAR, cr.event);
+    TEST_ASSERT_EQUAL_HEX32('\r', cr.cp);
+
+    TEST_ASSERT_EQUAL_INT(TTY_EV_NONE, tty_input('\n').event);
+}
+
 // Кириллица в raw тоже один символ, а не два байта: программа не должна
 // собирать UTF-8 сама.
 static void test_raw_cyrillic_one_event(void)
@@ -275,6 +340,11 @@ int main(void)
 
     RUN_TEST(test_canon_holds_until_enter);
     RUN_TEST(test_canon_lf_also_finishes_line);
+    RUN_TEST(test_canon_crlf_is_one_enter);
+    RUN_TEST(test_canon_crlf_next_line_clean);
+    RUN_TEST(test_canon_cr_then_letter_not_swallowed);
+    RUN_TEST(test_canon_lf_alone_still_enter);
+    RUN_TEST(test_canon_two_crs_two_lines);
     RUN_TEST(test_canon_echo_per_char);
     RUN_TEST(test_backspace_both_codes);
     RUN_TEST(test_backspace_at_start_is_bell);
@@ -287,6 +357,7 @@ int main(void)
 
     RUN_TEST(test_raw_emits_per_byte);
     RUN_TEST(test_raw_cr_is_plain_byte);
+    RUN_TEST(test_raw_crlf_is_one_enter);
     RUN_TEST(test_raw_cyrillic_one_event);
     RUN_TEST(test_raw_ctrl_c_still_works);
     RUN_TEST(test_raw_keeps_no_buffer);

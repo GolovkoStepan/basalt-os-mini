@@ -120,23 +120,25 @@ static void draw_static_content(void)
 
 void basalt_main(void)
 {
-    // Порядок как в остальных env: консоль первой - если что-то ниже зависнет,
-    // след останется в логе; пауза до вывода, чтобы хост открыл порт; векторы
-    // до работы с периферией.
+    // Порядок важнее, чем кажется, и по трём разным причинам: консоль первая
+    // (если ниже зависнет, след останется в логе); экран до паузы (панель
+    // хранит кадр прошлой сессии, пока его не затрут, и на экране висел бы
+    // старый текст - см. src/shell/main.c); векторы после паузы (их отчёт
+    // печатается, а порт на маке ещё не открыт).
     basalt_console_init();
     basalt_tick_init();
+
+    lcd_init();
+    lcd_backlight(true);
+    text_init();
+    present_dirty();
+
     basalt_delay_us(2000000);
     basalt_vectors_init();
 
     const uint64_t t_boot = basalt_uptime_us();
 
     basalt_put("\n\nbasalt-os text\n");
-
-    // Подсветка включается до первой заливки: иначе на тёмном экране не видно,
-    // случилось ли что-нибудь вообще.
-    lcd_init();
-    lcd_backlight(true);
-    text_init();
 
     draw_static_content();
 

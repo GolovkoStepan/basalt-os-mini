@@ -31,6 +31,9 @@ static utf8_decoder s_utf8;
 // иначе обработать строку было бы нечем.
 static bool s_ready;
 
+// Предыдущий байт был CR. Нужен, чтобы съесть LF из пары CR+LF.
+static bool s_cr;
+
 void tty_init(void)
 {
     memset(s_line, 0, sizeof(s_line));
@@ -38,6 +41,7 @@ void tty_init(void)
     s_seq_start = 0;
     s_mode = TTY_MODE_CANON;
     s_ready = false;
+    s_cr = false;
     utf8_reset(&s_utf8);
 }
 
@@ -54,6 +58,7 @@ void tty_set_mode(tty_mode mode)
     s_seq_start = 0;
     s_line[0] = '\0';
     s_ready = false;
+    s_cr = false;
     utf8_reset(&s_utf8);
 }
 
@@ -174,6 +179,17 @@ static void drop_partial(void)
 
 tty_result tty_input(uint8_t byte)
 {
+    // Enter приходит по-разному: терминал мака присылает CR, а `pio device
+    // monitor` с EOL=CRLF - пару CR+LF. Для нас это одно нажатие: иначе строка
+    // отправлялась бы дважды, и после каждой команды появлялась бы лишняя
+    // пустая строка с приглашением (проверено на живой плате 06.11.2026).
+    // Поэтому LF сразу за CR не отдаём никому: ни raw, ни канону.
+    if (byte == LF && s_cr) {
+        s_cr = false;
+        return make(TTY_EV_NONE, 0);
+    }
+    s_cr = (byte == CR);
+
     // Предыдущая строка уже отдана и прочитана (вызывающий успел её
     // разобрать, потому что обрабатывает событие до следующего чтения порта).
     // Теперь начинается новая.
