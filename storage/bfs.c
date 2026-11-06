@@ -1377,22 +1377,16 @@ int bfs_mkdir(bfs_t* fs, const char* path)
     if (rc != BFS_OK) {
         return rc;
     }
-    uint32_t data_block;
-    rc = block_alloc(fs, &data_block);
-    if (rc != BFS_OK) {
-        return rc;
-    }
-    memset(s_data, 0, BFS_BLOCK_SIZE);
-    rc = block_program(fs, data_block, s_data);
-    if (rc != BFS_OK) {
-        return rc;
-    }
 
+    // Блок под содержимое каталога здесь НЕ выделяется: пустой каталог
+    // занимает ноль байт и ноль блоков, а первый блок появится при первой
+    // записи в dir_add. Выделенный заранее блок при size == 0 стал бы утечкой:
+    // rmdir освобождает блоки по размеру, а не по указателям, и такой блок
+    // никто бы не вернул. Проверено тестом test_rmdir_frees_blocks.
     bfs_inode_disk_t ino;
     memset(&ino, 0, sizeof(ino));
     ino.mode = BFS_TYPE_DIR;
     ino.links = 2;
-    ino.direct[0] = data_block;
     rc = inode_store(fs, index, &ino);
     if (rc != BFS_OK) {
         return rc;

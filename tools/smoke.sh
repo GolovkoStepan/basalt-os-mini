@@ -45,6 +45,7 @@ case "$ENV" in
         READ_SECONDS=10
         PATTERNS=(
             '[shell] экран'
+            '[shell] ФС storage'
             'ready'
         )
         ;;

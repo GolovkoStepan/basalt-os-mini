@@ -211,6 +211,82 @@ void test_cyrillic_passes_through(void)
     TEST_ASSERT_EQUAL_STRING("привет", s_res.argv[1]);
 }
 
+// ---------------------------------------------------------------------------
+// Служебные токены
+// ---------------------------------------------------------------------------
+
+void test_out_is_a_token(void)
+{
+    TEST_ASSERT_EQUAL_INT(PARSE_OK, feed("echo a > f"));
+    TEST_ASSERT_EQUAL_INT(4, s_res.argc);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_WORD, s_res.kind[0]);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_WORD, s_res.kind[1]);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_OUT, s_res.kind[2]);
+    TEST_ASSERT_EQUAL_STRING(">", s_res.argv[2]);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_WORD, s_res.kind[3]);
+}
+
+void test_append_is_one_token(void)
+{
+    TEST_ASSERT_EQUAL_INT(PARSE_OK, feed("echo a >> f"));
+    TEST_ASSERT_EQUAL_INT(4, s_res.argc);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_APPEND, s_res.kind[2]);
+    TEST_ASSERT_EQUAL_STRING(">>", s_res.argv[2]);
+}
+
+void test_in_and_pipe_are_tokens(void)
+{
+    TEST_ASSERT_EQUAL_INT(PARSE_OK, feed("cat < f | ls"));
+    TEST_ASSERT_EQUAL_INT(5, s_res.argc);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_IN, s_res.kind[1]);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_PIPE, s_res.kind[3]);
+    TEST_ASSERT_EQUAL_STRING("|", s_res.argv[3]);
+}
+
+void test_glued_redirect_splits_words(void)
+{
+    // `a>f` без пробелов: слово, токен, слово. И следующее слово не съедено:
+    // служебный текст лежит вне буфера, поэтому ноль не затирает `f`.
+    TEST_ASSERT_EQUAL_INT(PARSE_OK, feed("echo a>f"));
+    TEST_ASSERT_EQUAL_INT(4, s_res.argc);
+    TEST_ASSERT_EQUAL_STRING("a", s_res.argv[1]);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_OUT, s_res.kind[2]);
+    TEST_ASSERT_EQUAL_STRING("f", s_res.argv[3]);
+}
+
+void test_quoted_redirect_is_a_word(void)
+{
+    TEST_ASSERT_EQUAL_INT(PARSE_OK, feed("echo '>' \"<\""));
+    TEST_ASSERT_EQUAL_INT(3, s_res.argc);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_WORD, s_res.kind[1]);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_WORD, s_res.kind[2]);
+    TEST_ASSERT_EQUAL_STRING(">", s_res.argv[1]);
+    TEST_ASSERT_EQUAL_STRING("<", s_res.argv[2]);
+}
+
+void test_escaped_redirect_is_a_word(void)
+{
+    TEST_ASSERT_EQUAL_INT(PARSE_OK, feed("echo \\| \\< \\>"));
+    TEST_ASSERT_EQUAL_INT(4, s_res.argc);
+    for (int i = 1; i < 4; ++i) {
+        TEST_ASSERT_EQUAL_INT(PARSE_TOK_WORD, s_res.kind[i]);
+    }
+    TEST_ASSERT_EQUAL_STRING("|", s_res.argv[1]);
+    TEST_ASSERT_EQUAL_STRING("<", s_res.argv[2]);
+    TEST_ASSERT_EQUAL_STRING(">", s_res.argv[3]);
+}
+
+void test_words_around_redirect_keep_order(void)
+{
+    // Сжатие буфера не должно путать порядок: путь идёт за своим токеном.
+    TEST_ASSERT_EQUAL_INT(PARSE_OK, feed("echo \"a b\" > f g"));
+    TEST_ASSERT_EQUAL_INT(5, s_res.argc);
+    TEST_ASSERT_EQUAL_STRING("a b", s_res.argv[1]);
+    TEST_ASSERT_EQUAL_INT(PARSE_TOK_OUT, s_res.kind[2]);
+    TEST_ASSERT_EQUAL_STRING("f", s_res.argv[3]);
+    TEST_ASSERT_EQUAL_STRING("g", s_res.argv[4]);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -241,6 +317,14 @@ int main(void)
     RUN_TEST(test_exactly_max_args);
     RUN_TEST(test_trailing_backslash_is_literal);
     RUN_TEST(test_cyrillic_passes_through);
+
+    RUN_TEST(test_out_is_a_token);
+    RUN_TEST(test_append_is_one_token);
+    RUN_TEST(test_in_and_pipe_are_tokens);
+    RUN_TEST(test_glued_redirect_splits_words);
+    RUN_TEST(test_quoted_redirect_is_a_word);
+    RUN_TEST(test_escaped_redirect_is_a_word);
+    RUN_TEST(test_words_around_redirect_keep_order);
 
     return UNITY_END();
 }

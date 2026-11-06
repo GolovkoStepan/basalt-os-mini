@@ -20,6 +20,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "bfs.h"
+#include "bfs_flash.h"
 #include "button.h"
 #include "console_usb_jtag.h"
 #include "esp_heap_caps.h"
@@ -29,12 +31,15 @@
 #include "lineedit.h"
 #include "matrix.h"
 #include "parse.h"
+#include "redirect.h"
 #include "stack.h"
 #include "start.h"
 #include "tick.h"
 #include "tty.h"
 #include "utf8.h"
 #include "vectors.h"
+#include "vfs.h"
+#include "vfs_bfs.h"
 
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
@@ -124,7 +129,174 @@ static void screen_put_cp(uint32_t cp)
     }
 }
 
-static void out_puts(const char* s)
+// --- куда идёт вывод команды ----------------------------------------------
+//
+// Три приёмника, а не один дескриптор: экран, файл и конвейер. Экран - это
+// текстовая матрица плюс зеркало в USB; файл и конвейер принимают байты.
+// Переключает приёмник выполнение строки, поэтому команды про перенаправления
+// ничего не знают - и знать не должны.
+
+typedef enum {
+    SINK_SCREEN = 0,
+    SINK_FILE,
+    SINK_PIPE,
+} out_sink;
+
+static out_sink s_sink = SINK_SCREEN;
+static int s_out_fd = -1;
+static bool s_out_failed;
+
+// Команда отказалась писать в этот файл (например, он же и источник). Тогда
+// приёмник не трогает файл вообще: без этого `cat /a > /a` успел бы обнулить
+// его ещё до чтения.
+static bool s_out_cancel;
+
+// Усечение отложено до первой записи. Причина та же: `cat /a > /a` открывается
+// на запись раньше, чем команда увидит, что читает тот же файл, и `O_TRUNC` в
+// этот момент уже уничтожил бы данные. Пустой вывод по-прежнему даёт пустой
+// файл - усечение делается в конце ступени, если писать так и не начали.
+static const char* s_out_path;
+static bool s_out_trunc_pending;
+
+// Канонический путь файла вывода - чтобы сравнивать с ним пути, которые
+// команде дали в argv (`cat /a > ./a` - тот же файл).
+static char s_out_canon[VFS_PATH_MAX];
+
+// Запись в файл копится в буфере размером с блок ФС. BFS переписывает блок
+// целиком, поэтому каждый мелкий vfs_write - это отдельная запись во flash
+// (~десятки миллисекунд). `help > файл` без буфера делает больше сотни таких
+// записей и выглядит как зависание: минуты без признаков жизни.
+#define OUT_BUF_SIZE 4096u
+static uint8_t s_out_buf[OUT_BUF_SIZE];
+static size_t s_out_len;
+
+// Конвейер без процессов: вывод предыдущей ступени копится целиком, следующая
+// читает его. Отсюда предел и честная ошибка, когда не влезло: молча
+// обрезанный вывод хуже отказа, потому что выглядит как правильный.
+//
+// Место - PSRAM: это ровно тот случай, для которого она нужна (буфер под
+// данные, а не под горячий код). Два буфера, потому что ступень читает из
+// одного и пишет в другой; если PSRAM на плате нет, годится и обычная память.
+#define PIPE_BUF_SIZE (64u * 1024u)
+static uint8_t* s_pipe[2];
+static int s_pipe_slot;
+static uint32_t s_pipe_len;
+static bool s_pipe_overflow;
+
+// Откуда команда читает, если ей не дали имени файла: `< файл` или конвейер.
+static int s_in_fd = -1;
+static bool s_stdin_pipe;
+static const uint8_t* s_pipe_in;
+static uint32_t s_pipe_in_len;
+static uint32_t s_pipe_in_pos;
+
+static uint8_t* pipe_buffer(int slot)
+{
+    if (s_pipe[slot] != NULL) {
+        return s_pipe[slot];
+    }
+    s_pipe[slot] = heap_caps_malloc(PIPE_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_pipe[slot] == NULL) {
+        s_pipe[slot] = heap_caps_malloc(PIPE_BUF_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return s_pipe[slot];
+}
+
+// Куда пишем на самом деле, в обход буфера. Только для приёмника файла.
+static void out_file_write(const uint8_t* data, size_t len)
+{
+    if (s_out_fd < 0 || s_out_failed) {
+        return;
+    }
+
+    if (s_out_trunc_pending) {
+        s_out_trunc_pending = false;
+        if (vfs_truncate(s_out_path, 0) != VFS_OK) {
+            s_out_failed = true;
+            return;
+        }
+    }
+
+    size_t done = 0;
+    while (done < len) {
+        uint32_t put = 0;
+        const int rc = vfs_write(s_out_fd, data + done, (uint32_t)(len - done), &put);
+        if (rc != VFS_OK || put == 0) {
+            s_out_failed = true;
+            return;
+        }
+        done += put;
+    }
+}
+
+static void out_file_flush(void)
+{
+    if (s_out_len == 0) {
+        return;
+    }
+    const size_t n = s_out_len;
+    s_out_len = 0;
+    out_file_write(s_out_buf, n);
+}
+
+static void sink_bytes(const uint8_t* data, size_t len)
+{
+    if (s_sink == SINK_PIPE) {
+        uint8_t* const buf = pipe_buffer(s_pipe_slot);
+        if (buf == NULL || len > PIPE_BUF_SIZE - s_pipe_len) {
+            s_pipe_overflow = true;
+            return;
+        }
+        memcpy(buf + s_pipe_len, data, len);
+        s_pipe_len += (uint32_t)len;
+        return;
+    }
+
+    if (s_sink == SINK_FILE) {
+        if (s_out_fd < 0 || s_out_failed || s_out_cancel) {
+            return;
+        }
+        while (len > 0) {
+            const size_t room = OUT_BUF_SIZE - s_out_len;
+            const size_t n = (len < room) ? len : room;
+            memcpy(s_out_buf + s_out_len, data, n);
+            s_out_len += n;
+            data += n;
+            len -= n;
+            if (s_out_len == OUT_BUF_SIZE) {
+                out_file_flush();
+            }
+        }
+    }
+}
+
+// Тот же ли это файл, что сейчас открыт на запись. Команда, которая собирается
+// читать файл, обязана спросить: иначе вывод затрёт вход, и прочитать будет
+// уже нечего. Возвращает false, если путь не разобрать - тогда решает команда.
+static bool sink_is_input(const char* path)
+{
+    if (s_out_canon[0] == '\0') {
+        return false;
+    }
+    char canon[VFS_PATH_MAX];
+    if (vfs_resolve(path, canon, sizeof(canon)) != VFS_OK) {
+        return false;
+    }
+    return strcmp(canon, s_out_canon) == 0;
+}
+
+// Команда нашла, что вход и выход - один файл. Печатает она сама (текст
+// зависит от команды), а здесь только запрет на запись и усечение.
+static void sink_cancel(void)
+{
+    s_out_cancel = true;
+}
+
+// Сообщения самой оболочки и ошибки команд. В отличие от out_puts идут на
+// экран всегда: `cat /nope > f` должен ругаться на экране, а не писать
+// «не найдено» в новый файл. В настоящем шелле для этого есть отдельный поток
+// ошибок - у нас его нет, значит нужна отдельная функция, а не флаг.
+static void out_diag(const char* s)
 {
     if (s == NULL) {
         return;
@@ -133,8 +305,27 @@ static void out_puts(const char* s)
     mirror_stream(s);
 }
 
+static void out_puts(const char* s)
+{
+    if (s == NULL) {
+        return;
+    }
+    if (s_sink != SINK_SCREEN) {
+        sink_bytes((const uint8_t*)s, strlen(s));
+        return;
+    }
+    text_puts(s);
+    mirror_stream(s);
+}
+
 static void out_cp(uint32_t cp)
 {
+    if (s_sink != SINK_SCREEN) {
+        char buf[4];
+        const size_t n = utf8_encode(cp, buf);
+        sink_bytes((const uint8_t*)buf, n);
+        return;
+    }
     screen_put_cp(cp);
     mirror_cp(cp);
 }
@@ -511,6 +702,429 @@ static void cmd_crash(int argc, char** argv)
     out_puts("исключения не было - это ошибка\n");
 }
 
+// --- файлы ----------------------------------------------------------------
+//
+// Команды над файлами - единственное место в оболочке, которое знает про VFS.
+// Пути, текущий каталог и таблица открытых файлов живут в storage/vfs.c;
+// здесь остаются argv, вывод и решения вроде «rm каталога - это rmdir».
+
+// Раздел storage и ФС на нём. В статике: монтирование одно на систему, а VFS
+// держит указатель на bfs_t всё время работы.
+static bfs_t s_fs;
+
+// Текст ошибки. Свои коды монтирования (BASALT_FS_*) и коды VFS_* численно
+// пересекаются, поэтому проверяются первыми.
+static void out_fs_error(int rc)
+{
+    switch (rc) {
+    case BASALT_FS_ERR_NO_FLASH:
+        out_diag("драйвер flash не завёлся");
+        return;
+    case BASALT_FS_ERR_NO_PARTITION:
+        out_diag("в таблице разделов нет раздела storage");
+        return;
+    case BASALT_FS_ERR_BAD_PARTITION:
+        out_diag("раздел storage негоден: не выровнен или не того размера");
+        return;
+    case BFS_ERR_BROKEN:
+        out_diag("ФС сломана, нужен перезапуск");
+        return;
+    case BFS_ERR_FORMAT:
+        out_diag("раздел не размечен");
+        return;
+    default:
+        out_diag(vfs_strerror(rc));
+        return;
+    }
+}
+
+// Смонтировать корень. Вызывается один раз при старте: дальше таблица точек
+// монтирования не меняется - размонтирования в интерфейсе нет.
+//
+// format_if_empty=true здесь - осознанное решение: раздел storage наш по
+// таблице разделов, и «первый запуск» - единственный случай, когда он пуст.
+// Отказ монтировать оставил бы систему без файлов до ручной команды, которой
+// пока нет.
+static void fs_mount_root(void)
+{
+    bool formatted = false;
+    int rc = basalt_fs_mount(&s_fs, "storage", true, &formatted);
+    if (rc != 0) {
+        out_diag("файлы недоступны: ");
+        out_fs_error(rc);
+        out_diag("\n");
+        basalt_put("[shell] ФС не смонтирована\n");
+        return;
+    }
+
+    vfs_init();
+    const vfs_backend_t be = vfs_bfs_backend(&s_fs);
+    rc = vfs_mount("/", &be);
+    if (rc != VFS_OK) {
+        out_diag("файлы недоступны: ");
+        out_diag(vfs_strerror(rc));
+        out_diag("\n");
+        basalt_put("[shell] VFS не смонтирован\n");
+        return;
+    }
+
+    basalt_put("[shell] ФС storage: ");
+    basalt_put(formatted ? "размечена заново\n" : "смонтирована\n");
+}
+
+// Размер в байтах. Единица печатается всегда: «12» без неё читалось бы и как
+// блоки, и как кибибайты.
+static void out_bytes(uint32_t size)
+{
+    out_u64(size);
+    out_puts(" Б");
+}
+
+static void out_path_error(int rc)
+{
+    out_fs_error(rc);
+    out_diag("\n");
+}
+
+static void cmd_ls(int argc, char** argv)
+{
+    const char* const path = (argc > 1) ? argv[1] : ".";
+
+    char name[VFS_NAME_MAX + 1];
+    uint32_t count = 0;
+
+    for (uint32_t i = 0;; ++i) {
+        vfs_stat_t st;
+        const int rc = vfs_readdir(path, i, name, &st);
+        if (rc == VFS_ERR_NOT_FOUND) {
+            break;
+        }
+        if (rc != VFS_OK) {
+            out_path_error(rc);
+            return;
+        }
+
+        out_puts(name);
+        if (st.type == VFS_TYPE_DIR) {
+            out_puts("/\n");
+        } else {
+            out_puts("  ");
+            out_bytes(st.size);
+            out_puts("\n");
+        }
+        ++count;
+    }
+
+    if (count == 0) {
+        out_puts("(пусто)\n");
+    }
+}
+
+// Буфер чтения в SRAM и маленький намеренно: cat файла на сотню килобайт не
+// должен упираться в «нет памяти». 512 Б - это меньше сектора, поэтому чтение
+// с диска всё равно идёт кусками по блокам внутри ФС.
+static uint8_t s_cat_buf[512];
+
+static bool stdin_ready(void)
+{
+    return s_stdin_pipe || s_in_fd >= 0;
+}
+
+// Чтение из stdin: либо из буфера предыдущей ступени конвейера, либо из файла
+// после `<`. Ноль прочитанных байт на любой из них значит «конец», а не
+// ошибку, - так же, как у обычного read.
+static int stdin_read(uint8_t* dst, uint32_t cap, uint32_t* got)
+{
+    *got = 0;
+    if (s_stdin_pipe) {
+        const uint32_t left = s_pipe_in_len - s_pipe_in_pos;
+        const uint32_t n = (left < cap) ? left : cap;
+        if (n != 0) {
+            memcpy(dst, s_pipe_in + s_pipe_in_pos, n);
+            s_pipe_in_pos += n;
+            *got = n;
+        }
+        return VFS_OK;
+    }
+    if (s_in_fd >= 0) {
+        return vfs_read(s_in_fd, dst, cap, got);
+    }
+    return VFS_OK;
+}
+
+static void cmd_cat(int argc, char** argv)
+{
+    int fd = -1;
+    int rc = VFS_OK;
+
+    // Без аргумента cat читает stdin - это единственное, ради чего нужен `<`
+    // и что делает конвейер осмысленным.
+    const bool from_stdin = (argc < 2);
+
+    if (from_stdin) {
+        if (!stdin_ready()) {
+            out_diag("cat <файл>  или  cat < файл  или  вывод слева от |\n");
+            return;
+        }
+    } else {
+        // Тот же файл, что сейчас открыт на запись (`cat /a > /a`): прочитать
+        // его уже не выйдет - точнее, выйдет пустоту. Отказываемся до открытия.
+        if (sink_is_input(argv[1])) {
+            out_diag("cat: этот файл сейчас перенаправлен на вывод\n");
+            sink_cancel();
+            return;
+        }
+        rc = vfs_open(argv[1], VFS_O_RDONLY, &fd);
+        if (rc != VFS_OK) {
+            out_path_error(rc);
+            return;
+        }
+    }
+
+    // Свой декодер на команду: он живёт между кусками чтения, иначе буква на
+    // границе двух чтений рассыпалась бы. Через out_cp, а не out_puts: файл -
+    // это байты, а не C-строка, нулей внутри него быть не может.
+    //
+    // В файл и в конвейер байты идут **как есть**. Разбирать UTF-8 на выходе
+    // значило бы терять всё, что не является корректной последовательностью:
+    // `cat /big > /copy` (где /big - не текст) давал файл заметно короче
+    // исходного, и заметить это можно было только по размеру. Декодер нужен
+    // ровно одному приёмнику - экранной матрице, которая знает только code point.
+    const bool raw = (s_sink != SINK_SCREEN);
+
+    utf8_decoder dec;
+    utf8_reset(&dec);
+    bool any = false;
+    uint8_t last = '\n';
+
+    for (;;) {
+        uint32_t got = 0;
+        rc = from_stdin ? stdin_read(s_cat_buf, sizeof(s_cat_buf), &got)
+                        : vfs_read(fd, s_cat_buf, sizeof(s_cat_buf), &got);
+        if (rc != VFS_OK) {
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+
+        any = true;
+        last = s_cat_buf[got - 1];
+
+        if (raw) {
+            sink_bytes(s_cat_buf, got);
+            continue;
+        }
+
+        for (uint32_t i = 0; i < got; ++i) {
+            uint32_t cp = 0;
+            if (utf8_feed(&dec, s_cat_buf[i], &cp) == UTF8_DONE) {
+                out_cp(cp);
+            }
+        }
+    }
+    if (fd >= 0) {
+        vfs_close(fd);
+    }
+
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+        return;
+    }
+
+    // Недостающий перевод строки добавляем только на экране: иначе приглашение
+    // прилипло бы к последней строке файла. В файл и конвейер лишний байт не
+    // пишем - `cat` обязан копировать один в один.
+    if (!raw && (!any || last != '\n')) {
+        out_puts("\n");
+    }
+}
+
+static void cmd_cd(int argc, char** argv)
+{
+    const int rc = vfs_chdir((argc > 1) ? argv[1] : "/");
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+    }
+}
+
+static void cmd_pwd(int argc, char** argv)
+{
+    (void)argc;
+    (void)argv;
+    out_puts(vfs_cwd());
+    out_puts("\n");
+}
+
+static void cmd_stat(int argc, char** argv)
+{
+    if (argc < 2) {
+        out_diag("stat <путь>\n");
+        return;
+    }
+
+    vfs_stat_t st;
+    const int rc = vfs_stat(argv[1], &st);
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+        return;
+    }
+
+    out_puts(st.type == VFS_TYPE_DIR ? "каталог, " : "файл, ");
+    out_bytes(st.size);
+    out_puts("\n");
+}
+
+static void cmd_mkdir(int argc, char** argv)
+{
+    if (argc < 2) {
+        out_diag("mkdir <каталог>\n");
+        return;
+    }
+    const int rc = vfs_mkdir(argv[1]);
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+    }
+}
+
+static void cmd_rm(int argc, char** argv)
+{
+    if (argc < 2) {
+        out_diag("rm <файл>\n");
+        return;
+    }
+
+    const int rc = vfs_unlink(argv[1]);
+    if (rc == VFS_ERR_IS_DIR) {
+        // Отдельной строкой: «это каталог» без подсказки заставляет гадать,
+        // чем его удалять.
+        out_diag("это каталог: rmdir ");
+        out_diag(argv[1]);
+        out_diag("\n");
+        return;
+    }
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+    }
+}
+
+static void cmd_rmdir(int argc, char** argv)
+{
+    if (argc < 2) {
+        out_diag("rmdir <каталог>\n");
+        return;
+    }
+    const int rc = vfs_rmdir(argv[1]);
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+    }
+}
+
+// Те же 4 КБ, что и блок BFS: один вызов записи - один коммит ФС, поэтому
+// мельче буфер означал бы больше коммитов на тот же файл и больше времени.
+static uint8_t s_cp_buf[4096];
+
+static void cmd_cp(int argc, char** argv)
+{
+    if (argc < 3) {
+        out_diag("cp <откуда> <куда>\n");
+        return;
+    }
+
+    // Копирование файла в себя сначала обнулило бы его (O_TRUNC), а потом
+    // прочитало пустоту. Такое лучше отвергнуть сразу, чем объяснять
+    // пропавшие данные.
+    char from[VFS_PATH_MAX];
+    char to[VFS_PATH_MAX];
+    if (vfs_resolve(argv[1], from, sizeof(from)) == VFS_OK &&
+        vfs_resolve(argv[2], to, sizeof(to)) == VFS_OK && strcmp(from, to) == 0) {
+        out_diag("cp: откуда и куда - один и тот же файл\n");
+        return;
+    }
+
+    int src = -1;
+    int rc = vfs_open(argv[1], VFS_O_RDONLY, &src);
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+        return;
+    }
+
+    int dst = -1;
+    rc = vfs_open(argv[2], VFS_O_CREATE | VFS_O_TRUNC | VFS_O_WRONLY, &dst);
+    if (rc != VFS_OK) {
+        vfs_close(src);
+        out_path_error(rc);
+        return;
+    }
+
+    for (;;) {
+        uint32_t got = 0;
+        rc = vfs_read(src, s_cp_buf, sizeof(s_cp_buf), &got);
+        if (rc != VFS_OK || got == 0) {
+            break;
+        }
+
+        uint32_t put = 0;
+        rc = vfs_write(dst, s_cp_buf, got, &put);
+        if (rc != VFS_OK) {
+            break;
+        }
+        if (put != got) {
+            // Меньше записалось - значит, место кончилось на середине, и
+            // копия неполная. Молчать об этом нельзя.
+            rc = VFS_ERR_NO_SPACE;
+            break;
+        }
+    }
+
+    vfs_close(dst);
+    vfs_close(src);
+
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+    }
+}
+
+static void cmd_mv(int argc, char** argv)
+{
+    if (argc < 3) {
+        out_diag("mv <откуда> <куда>\n");
+        return;
+    }
+
+    const int rc = vfs_rename(argv[1], argv[2]);
+    if (rc == VFS_ERR_ARG) {
+        // За этой ошибкой стоит единственный случай, который в VFS запрещён
+        // намеренно: переименование через границу точек монтирования.
+        out_diag("mv: переименовать между разными точками монтирования нельзя\n");
+        return;
+    }
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+    }
+}
+
+static void cmd_df(int argc, char** argv)
+{
+    uint32_t used = 0;
+    uint32_t total = 0;
+    const int rc = vfs_usage((argc > 1) ? argv[1] : "/", &used, &total);
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+        return;
+    }
+
+    out_puts("занято ");
+    out_kib(used);
+    out_puts(" из ");
+    out_kib(total);
+    out_puts(" (");
+    out_percent(used, total);
+    out_puts("), свободно ");
+    out_kib(total - used);
+    out_puts("\n");
+}
+
 static const command s_commands[] = {
     {"help",    cmd_help,    "этот список"},
     {"echo",    cmd_echo,    "напечатать аргументы"},
@@ -524,6 +1138,17 @@ static const command s_commands[] = {
     {"mirror",  cmd_mirror,  "on|off: повторять поток в USB"},
     {"reboot",  cmd_reboot,  "перезагрузка"},
     {"crash",   cmd_crash,   "проверить панику"},
+    {"ls",      cmd_ls,      "каталог: имена и размеры"},
+    {"cat",     cmd_cat,     "показать файл"},
+    {"cd",      cmd_cd,      "сменить каталог"},
+    {"pwd",     cmd_pwd,     "текущий каталог"},
+    {"stat",    cmd_stat,    "тип и размер"},
+    {"mkdir",   cmd_mkdir,   "создать каталог"},
+    {"rm",      cmd_rm,      "удалить файл"},
+    {"rmdir",   cmd_rmdir,   "удалить пустой каталог"},
+    {"cp",      cmd_cp,      "скопировать файл"},
+    {"mv",      cmd_mv,      "переименовать"},
+    {"df",      cmd_df,      "место в ФС"},
 };
 
 static const size_t s_command_count = sizeof(s_commands) / sizeof(s_commands[0]);
@@ -561,6 +1186,148 @@ static void cmd_help(int argc, char** argv)
 // Разбор и запуск. Строка приходит из редактора, а он правит буфер на месте -
 // поэтому работаем с копией: parse_line расставляет нули, и после него
 // le_line() уже не та строка, которую набрали.
+
+static command_fn find_command(const char* name)
+{
+    for (size_t i = 0; i < s_command_count; ++i) {
+        if (strcmp(name, s_commands[i].name) == 0) {
+            return s_commands[i].fn;
+        }
+    }
+    return NULL;
+}
+
+// Выполнить одну ступень: открыть `<` и `>`, выставить приёмник, позвать
+// команду, всё вернуть назад. false - строку надо бросить (причина уже
+// напечатана).
+//
+// Приёмник восстанавливается до печати ошибок намеренно: сообщение оболочки
+// принадлежит экрану, а не файлу, в который команда не смогла писать.
+static bool run_stage(const redirect_stage* st, bool capture, int slot)
+{
+    // Вход и выход - один файл: усечение при первой записи обрезало бы данные,
+    // которые команда ещё читает. Проверяем до открытия, пока ничего не тронуто.
+    if (st->in_path != NULL && st->out_path != NULL) {
+        char from[VFS_PATH_MAX];
+        char to[VFS_PATH_MAX];
+        if (vfs_resolve(st->in_path, from, sizeof(from)) == VFS_OK &&
+            vfs_resolve(st->out_path, to, sizeof(to)) == VFS_OK &&
+            strcmp(from, to) == 0) {
+            out_diag("?: вход и выход - один и тот же файл\n");
+            return false;
+        }
+    }
+
+    int in_fd = -1;
+    if (st->in_path != NULL) {
+        const int rc = vfs_open(st->in_path, VFS_O_RDONLY, &in_fd);
+        if (rc != VFS_OK) {
+            out_diag(st->in_path);
+            out_diag(": ");
+            out_diag(vfs_strerror(rc));
+            out_diag("\n");
+            return false;
+        }
+    }
+
+    int out_fd = -1;
+    if (st->out_path != NULL) {
+        // Без O_TRUNC: усечение отложено до первой записи (см. s_out_trunc_pending).
+        const uint8_t flags = (uint8_t)(VFS_O_WRONLY | VFS_O_CREATE |
+                                        (st->append ? VFS_O_APPEND : 0));
+        const int rc = vfs_open(st->out_path, flags, &out_fd);
+        if (rc != VFS_OK) {
+            if (in_fd >= 0) {
+                vfs_close(in_fd);
+            }
+            out_diag(st->out_path);
+            out_diag(": ");
+            out_diag(vfs_strerror(rc));
+            out_diag("\n");
+            return false;
+        }
+    }
+
+    const out_sink prev_sink = s_sink;
+    const int prev_out = s_out_fd;
+    s_out_fd = out_fd;
+    s_out_failed = false;
+    s_out_cancel = false;
+    s_out_len = 0;
+    s_out_path = st->out_path;
+    s_out_trunc_pending = (out_fd >= 0 && !st->append);
+    s_out_canon[0] = '\0';
+    if (out_fd >= 0) {
+        vfs_resolve(st->out_path, s_out_canon, sizeof(s_out_canon));
+    }
+    s_in_fd = in_fd;
+
+    if (capture) {
+        s_sink = SINK_PIPE;
+        s_pipe_slot = slot;
+        s_pipe_len = 0;
+        s_pipe_overflow = false;
+    } else {
+        s_sink = (out_fd >= 0) ? SINK_FILE : SINK_SCREEN;
+    }
+
+    const command_fn fn = find_command(st->argv[0]);
+    if (fn != NULL) {
+        fn(st->argc, st->argv);
+    }
+
+    // Дописать остаток буфера и, если писать так и не начали, всё-таки
+    // усечь файл: `> f` без вывода даёт пустой файл, как в sh.
+    if (out_fd >= 0 && !s_out_cancel) {
+        out_file_flush();
+        if (s_out_trunc_pending) {
+            s_out_trunc_pending = false;
+            if (vfs_truncate(s_out_path, 0) != VFS_OK) {
+                s_out_failed = true;
+            }
+        }
+    }
+
+    s_sink = prev_sink;
+    s_out_fd = prev_out;
+    s_out_len = 0;
+    s_out_path = NULL;
+    s_out_trunc_pending = false;
+    s_out_canon[0] = '\0';
+    s_in_fd = -1;
+
+    if (out_fd >= 0) {
+        vfs_close(out_fd);
+    }
+    if (in_fd >= 0) {
+        vfs_close(in_fd);
+    }
+
+    if (fn == NULL) {
+        out_diag("?: ");
+        out_diag(st->argv[0]);
+        out_diag(": нет такой команды, help - список\n");
+        return false;
+    }
+    if (s_out_cancel) {
+        return false;
+    }
+    if (s_out_failed) {
+        out_diag("?: ");
+        out_diag(st->out_path);
+        out_diag(": запись не удалась, место кончилось?\n");
+        return false;
+    }
+    if (capture && s_pipe_overflow) {
+        char num[21];
+        out_diag("?: конвейер: вывод не влез в ");
+        out_diag(basalt_format_u64(num, sizeof(num), PIPE_BUF_SIZE / 1024u));
+        out_diag(" КБ\n");
+        return false;
+    }
+    return true;
+}
+
 static void run_command(const char* line)
 {
     char buf[LINEEDIT_CAP];
@@ -573,11 +1340,11 @@ static void run_command(const char* line)
         break;
 
     case PARSE_ERR_QUOTE:
-        out_puts("?: кавычка не закрыта\n");
+        out_diag("?: кавычка не закрыта\n");
         return;
 
     case PARSE_ERR_ARGS:
-        out_puts("?: слишком много слов\n");
+        out_diag("?: слишком много слов\n");
         return;
     }
 
@@ -585,16 +1352,39 @@ static void run_command(const char* line)
         return;
     }
 
-    for (size_t i = 0; i < s_command_count; ++i) {
-        if (strcmp(args.argv[0], s_commands[i].name) == 0) {
-            s_commands[i].fn(args.argc, args.argv);
-            return;
+    redirect_plan plan;
+    const redirect_status rs = redirect_build(&args, &plan);
+    if (rs != REDIRECT_OK) {
+        out_diag("?: ");
+        out_diag(redirect_strerror(rs));
+        out_diag("\n");
+        return;
+    }
+
+    s_pipe_in = NULL;
+    s_pipe_in_len = 0;
+    s_pipe_in_pos = 0;
+
+    for (int i = 0; i < plan.count; ++i) {
+        const bool last = (i + 1 == plan.count);
+
+        // Вход ступени - то, что накопила предыдущая. Флаг отдельно от
+        // указателя: у пустого вывода буфера может не быть, но «вход есть,
+        // он пустой» и «входа нет» - разные вещи.
+        s_stdin_pipe = (i > 0);
+
+        if (!run_stage(&plan.stage[i], !last, i % 2)) {
+            break;
+        }
+        if (!last) {
+            s_pipe_in = s_pipe[i % 2];
+            s_pipe_in_len = s_pipe_len;
+            s_pipe_in_pos = 0;
         }
     }
 
-    out_puts("?: ");
-    out_puts(args.argv[0]);
-    out_puts(": нет такой команды, help - список\n");
+    s_stdin_pipe = false;
+    s_pipe_in = NULL;
 }
 
 // --- обработка событий редактора -----------------------------------------
@@ -737,6 +1527,7 @@ void basalt_main(void)
     tty_set_mode(TTY_MODE_RAW);
     button_init();
     le_init();
+    fs_mount_root();
 
     out_puts("basalt-os mini\n");
     out_puts("\n");

@@ -481,6 +481,32 @@ void test_unlink_frees_blocks(void)
     TEST_ASSERT_EQUAL_UINT32(used_after, used_remount);
 }
 
+// Удаление каталога обязано возвращать его блоки в оборот: иначе каждый
+// mkdir/rmdir терял бы блок навсегда, и место кончалось бы без файлов.
+void test_rmdir_frees_blocks(void)
+{
+    mount_fresh();
+    uint32_t baseline = 0;
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_usage(&s_fs, &baseline, NULL));
+
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_mkdir(&s_fs, "/etc"));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_mkdir(&s_fs, "/etc/rc.d"));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_rmdir(&s_fs, "/etc/rc.d"));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_rmdir(&s_fs, "/etc"));
+
+    uint32_t after = 0;
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_usage(&s_fs, &after, NULL));
+    TEST_ASSERT_EQUAL_UINT32(baseline, after);
+
+    // И после перемонтирования: битмап собирается обходом, и освобождение
+    // должно быть видно уже из диска, а не только из памяти.
+    bfs_device_t dev = device_for(&s_disk);
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_mount(&s_fs, &dev));
+    uint32_t remount = 0;
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_usage(&s_fs, &remount, NULL));
+    TEST_ASSERT_EQUAL_UINT32(baseline, remount);
+}
+
 void test_unlink_directory_fails(void)
 {
     mount_fresh();
@@ -704,6 +730,7 @@ int main(void)
     RUN_TEST(test_create_under_file_fails);
     RUN_TEST(test_readdir_skips_tombstones);
     RUN_TEST(test_unlink_frees_blocks);
+    RUN_TEST(test_rmdir_frees_blocks);
     RUN_TEST(test_unlink_directory_fails);
     RUN_TEST(test_rmdir_non_empty_fails);
     RUN_TEST(test_rename_same_dir);

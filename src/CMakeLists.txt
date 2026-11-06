@@ -74,8 +74,10 @@ elseif(BASALT_APP_TTY)
     set(BASALT_BUTTON_SRC "../drivers/button_gpio.c")
 elseif(BASALT_APP_SHELL)
     # Шелл: тот же экран и тот же tty, что в env:tty, плюс правка строки,
-    # история и разбор. Веткой, а не флагом в общем main.c: у env:tty остаётся
-    # свой маленький main, и его проверенная сборка не растёт от шелла.
+    # история, разбор и файлы. Файлы - это драйвер flash, разбор таблицы
+    # разделов, BFS, привязка ФС к разделу и VFS: команда ls без всего этого
+    # не соберётся, поэтому слой хранилища здесь не «мёртвый код», а часть
+    # вехи A9.
     set(BASALT_APP_SRC "shell/main.c")
     set(BASALT_TEXT_SRC
         "../text/matrix.c"
@@ -88,16 +90,25 @@ elseif(BASALT_APP_SHELL)
     set(BASALT_BUTTON_SRC "../drivers/button_gpio.c")
     set(BASALT_SHELL_SRC
         "../shell/parse.c"
+        "../shell/redirect.c"
         "../shell/history.c"
         "../shell/lineedit.c"
     )
     set(BASALT_SHELL_INC "../shell")
+    set(BASALT_FLASH_SRC "../arch/xtensa/flash.c")
+    set(BASALT_STORAGE_SRC
+        "../storage/parttable.c"
+        "../storage/bfs.c"
+        "../storage/bfs_flash.c"
+        "../storage/vfs.c"
+        "../storage/vfs_bfs.c"
+    )
+    set(BASALT_STORAGE_INC "../storage")
 elseif(BASALT_APP_FLASH)
     # Щуп встроенного flash: тот же старт и та же консоль, но свой main.c и
-    # драйвер flash. Драйвер подключается только здесь: пока он нужен одному
-    # щупу, проверенные сборки A0 не должны расти мёртвым кодом. В A9, когда
-    # без него не соберётся ни один env с файлами, строка переедет в общий
-    # список.
+    # драйвер flash. Драйвер подключается точечно - здесь и в ветках, где без
+    # файлов не обойтись (fs, shell): проверенные сборки A0 (bare, console) не
+    # должны расти мёртвым кодом.
     set(BASALT_APP_SRC "flash/main.c")
     set(BASALT_FLASH_SRC "../arch/xtensa/flash.c")
     # Разбор таблицы разделов нужен и щупу, и будущей ФС. Модуль переносимый
@@ -105,14 +116,15 @@ elseif(BASALT_APP_FLASH)
     set(BASALT_STORAGE_SRC "../storage/parttable.c")
     set(BASALT_STORAGE_INC "../storage")
 elseif(BASALT_APP_FS)
-    # Щуп файловой системы: драйвер flash, разбор таблицы разделов и сама BFS.
-    # Отдельная ветка, потому что здесь впервые встречаются все три слоя, и
-    # именно она проверяет на железе то, что тесты проверяют на маке.
+    # Щуп файловой системы: драйвер flash, разбор таблицы разделов, сама BFS и
+    # привязка ФС к разделу. Привязка (bfs_flash.c) - та же, что у оболочки:
+    # щуп не должен уметь то, чего не умеет система.
     set(BASALT_APP_SRC "fs/main.c")
     set(BASALT_FLASH_SRC "../arch/xtensa/flash.c")
     set(BASALT_STORAGE_SRC
         "../storage/parttable.c"
         "../storage/bfs.c"
+        "../storage/bfs_flash.c"
     )
     set(BASALT_STORAGE_INC "../storage")
 else()

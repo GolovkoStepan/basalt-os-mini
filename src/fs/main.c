@@ -20,18 +20,13 @@
 #include "esp_heap_caps.h"
 
 #include "bfs.h"
+#include "bfs_flash.h"
 #include "console_usb_jtag.h"
 #include "flash.h"
 #include "format.h"
 #include "indicator.h"
-#include "parttable.h"
 #include "tick.h"
 #include "vectors.h"
-
-// Таблица разделов лежит на 0x8000 и занимает 0xC00 значащих байт - те же
-// числа, что в env:flash: источник один, формат IDF.
-#define PARTITION_TABLE_ADDR 0x8000u
-#define PARTITION_TABLE_MAX  0xC00u
 
 #define INDICATOR_ALIVE_LEVEL 40
 
@@ -68,6 +63,9 @@ static void put_err(int err)
         case BFS_ERR_NAME: basalt_put("негодное имя"); break;
         case BFS_ERR_ARG: basalt_put("негодный аргумент"); break;
         case BFS_ERR_BROKEN: basalt_put("ФС сломана, нужен remount"); break;
+        case BASALT_FS_ERR_NO_FLASH: basalt_put("драйвер flash не завёлся"); break;
+        case BASALT_FS_ERR_NO_PARTITION: basalt_put("в таблице разделов нет раздела с такой меткой"); break;
+        case BASALT_FS_ERR_BAD_PARTITION: basalt_put("раздел негоден: не выровнен или не того размера"); break;
         default: basalt_put("неизвестный код"); break;
         }
         basalt_put(")");
@@ -104,78 +102,13 @@ static void put_speed(uint32_t bytes, uint64_t us)
 }
 
 // ---------------------------------------------------------------------------
-// Блочное устройство поверх драйвера flash
+// Блочное устройство и раздел
 //
-// Смещения BFS считает от начала раздела, а драйвер - от начала чипа, поэтому
-// адаптер держит базу и границы раздела. Границы проверяются здесь: ошибка в
-// карте блоков не должна превращаться в стирание чужого раздела.
+// Сама привязка (поиск раздела storage, проверка границ, адаптер поверх
+// драйвера flash) живёт в storage/bfs_flash.c - её же зовёт оболочка при
+// старте. Здесь только измерения: щуп не должен уметь то, чего не умеет
+// система, иначе «в щупе работает» перестанет что-то значить.
 // ---------------------------------------------------------------------------
-
-typedef struct {
-    uint32_t base;
-    uint32_t size;
-} partition_dev_t;
-
-static int dev_read(void* ctx, uint32_t offset, void* dst, uint32_t len)
-{
-    const partition_dev_t* const p = (const partition_dev_t*)ctx;
-    if (offset > p->size || len > p->size - offset) {
-        return -1;
-    }
-    return basalt_flash_read(p->base + offset, dst, len);
-}
-
-static int dev_erase(void* ctx, uint32_t offset)
-{
-    const partition_dev_t* const p = (const partition_dev_t*)ctx;
-    if (offset > p->size || BFS_BLOCK_SIZE > p->size - offset ||
-        offset % BASALT_FLASH_SECTOR_SIZE != 0u) {
-        return -1;
-    }
-    return basalt_flash_erase_sector(p->base + offset);
-}
-
-static int dev_write(void* ctx, uint32_t offset, const void* src, uint32_t len)
-{
-    const partition_dev_t* const p = (const partition_dev_t*)ctx;
-    if (offset > p->size || len > p->size - offset) {
-        return -1;
-    }
-    return basalt_flash_write(p->base + offset, src, len);
-}
-
-// ---------------------------------------------------------------------------
-// Раздел
-// ---------------------------------------------------------------------------
-
-// Найти раздел storage в таблице разделов. true - найден.
-static bool find_storage(basalt_partition_t* out)
-{
-    uint8_t* const table =
-        heap_caps_malloc(PARTITION_TABLE_MAX, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (table == NULL) {
-        basalt_put("[fs] раздел storage: нет памяти под таблицу разделов\n");
-        return false;
-    }
-
-    const int err = basalt_flash_read(PARTITION_TABLE_ADDR, table, PARTITION_TABLE_MAX);
-    const bool found =
-        err == 0 && basalt_parttable_find(table, PARTITION_TABLE_MAX, "storage", out);
-
-    heap_caps_free(table);
-
-    if (err != 0) {
-        basalt_put("[fs] раздел storage: таблица разделов не читается, ");
-        put_err(err);
-        basalt_put("\n");
-        return false;
-    }
-    if (!found) {
-        basalt_put("[fs] раздел storage: в таблице разделов его нет\n");
-        return false;
-    }
-    return true;
-}
 
 // ---------------------------------------------------------------------------
 // Данные для проверки
@@ -191,23 +124,23 @@ static uint8_t pattern_byte(uint32_t offset)
 // ---------------------------------------------------------------------------
 
 static bfs_t s_fs;
-static partition_dev_t s_dev;
 
 // Монтирование, а если раздел не размечен - разметка. Возвращает 0 или код.
-static int mount_or_format(void)
+//
+// Меряем отдельно монтирование, разметку и монтирование после неё: у щупа
+// ценность ровно в этих числах, а не в одной сумме. Поэтому здесь два вызова
+// basalt_fs_mount (сначала без разметки), а не один с format_if_empty.
+static int mount_or_format(uint32_t part_size)
 {
-    const bfs_device_t device = {&s_dev, dev_read, dev_erase, dev_write};
-    const uint32_t blocks = s_dev.size / BFS_BLOCK_SIZE;
-
     uint64_t t0 = basalt_uptime_us();
-    int rc = bfs_mount(&s_fs, &device);
+    int rc = basalt_fs_mount(&s_fs, "storage", false, NULL);
     uint64_t t1 = basalt_uptime_us();
 
     basalt_put("[fs] монтирование: ");
-    if (rc == BFS_OK) {
+    if (rc == 0) {
         put_ms(t1 - t0);
         basalt_put("\n");
-        return BFS_OK;
+        return 0;
     }
     if (rc != BFS_ERR_FORMAT) {
         basalt_put("не удалось, ");
@@ -219,16 +152,16 @@ static int mount_or_format(void)
     basalt_put("раздел не размечен - размечаю\n");
 
     t0 = basalt_uptime_us();
-    rc = bfs_format(&s_fs, &device, blocks);
+    rc = basalt_fs_format(&s_fs, "storage");
     t1 = basalt_uptime_us();
-    if (rc != BFS_OK) {
+    if (rc != 0) {
         basalt_put("[fs] форматирование: не удалось, ");
         put_err(rc);
         basalt_put("\n");
         return rc;
     }
     basalt_put("[fs] форматирование ");
-    put_kib(s_dev.size);
+    put_kib(part_size);
     basalt_put(": ");
     put_ms(t1 - t0);
     basalt_put("\n");
@@ -236,17 +169,17 @@ static int mount_or_format(void)
     // Монтирование после разметки - не формальность: format оставил ФС в
     // памяти, а дальше всё должно читаться с диска, как после перезагрузки.
     t0 = basalt_uptime_us();
-    rc = bfs_mount(&s_fs, &device);
+    rc = basalt_fs_mount(&s_fs, "storage", false, NULL);
     t1 = basalt_uptime_us();
     basalt_put("[fs] монтирование после разметки: ");
-    if (rc != BFS_OK) {
+    if (rc != 0) {
         put_err(rc);
         basalt_put("\n");
         return rc;
     }
     put_ms(t1 - t0);
     basalt_put("\n");
-    return BFS_OK;
+    return 0;
 }
 
 static bool write_files(void)
@@ -360,14 +293,12 @@ static bool write_files(void)
 // Чтение после перемонтирования: то, что лежит на диске, а не в памяти.
 static bool verify_after_remount(void)
 {
-    const bfs_device_t device = {&s_dev, dev_read, dev_erase, dev_write};
-
     const uint64_t t0 = basalt_uptime_us();
-    const int rc = bfs_mount(&s_fs, &device);
+    const int rc = basalt_fs_mount(&s_fs, "storage", false, NULL);
     const uint64_t t1 = basalt_uptime_us();
 
     basalt_put("[fs] перемонтирование: ");
-    if (rc != BFS_OK) {
+    if (rc != 0) {
         put_err(rc);
         basalt_put("\n");
         return false;
@@ -514,26 +445,26 @@ void basalt_main(void)
         put_kib(basalt_flash_size());
         basalt_put("\n");
 
-        basalt_partition_t part;
-        if (find_storage(&part)) {
+        uint32_t address = 0;
+        uint32_t size = 0;
+        const int part_rc = basalt_fs_partition("storage", &address, &size);
+        if (part_rc != 0) {
+            basalt_put("[fs] раздел storage: ");
+            put_err(part_rc);
+            basalt_put("\n");
+        } else {
             basalt_put("[fs] раздел storage: 0x");
-            basalt_put_hex(part.address, 6);
+            basalt_put_hex(address, 6);
             basalt_put(", ");
-            put_kib(part.size);
+            put_kib(size);
             basalt_put(", блоков ");
-            basalt_put_u64(part.size / BFS_BLOCK_SIZE);
+            basalt_put_u64(size / BFS_BLOCK_SIZE);
             basalt_put("\n");
 
-            s_dev.base = part.address;
-            s_dev.size = part.size;
-
-            if (part.address % BASALT_FLASH_SECTOR_SIZE != 0u) {
-                basalt_put("[fs] начало раздела не выровнено по сектору - работать нельзя\n");
-            } else if (part.size / BFS_BLOCK_SIZE < 16u) {
-                basalt_put("[fs] раздел меньше 16 блоков - BFS в него не влезет\n");
-            } else if (part.size / BFS_BLOCK_SIZE > BFS_MAX_BLOCKS) {
-                basalt_put("[fs] раздел больше BFS_MAX_BLOCKS - битмап не рассчитан\n");
-            } else if (mount_or_format() == BFS_OK) {
+            // Выравнивание и размер раздела проверяет basalt_fs_mount: две
+            // проверки на одно условие однажды разойдутся, и щуп начнёт
+            // пропускать то, на чём система откажется работать.
+            if (mount_or_format(size) == 0) {
                 ok = write_files();
                 ok = verify_after_remount() && ok;
             }
