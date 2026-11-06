@@ -35,10 +35,10 @@ CONFIG_ESP_TASK_WDT_EN=n
 ; и работает дальше, как раньше. Когда env:bare уедет в capsh вместе с
 ; платой, флаг убрать: честнее падать, если PSRAM не нашлась.
 ;
-; Отдельного sdkconfig для tdisplay нет вынужденно: PlatformIO 6.2 читает
-; только sdkconfig.defaults, а разделитель списка «;» в platformio.ini - это
-; начало комментария, поэтому -DSDKCONFIG_DEFAULTS=файл1;файл2 не задать.
-; Проверено по ~/.platformio/platforms/espressif32/builder/frameworks/espidf.py.
+; Настройки, которые различаются у плат (размер flash), лежат не здесь, а рядом:
+; sdkconfig.defaults.tdisplay и sdkconfig.defaults.cardputer. Их подключает
+; CMakeLists.txt вторым файлом умолчаний - через platformio.ini это не задать,
+; там «;» в списке означает начало комментария.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y

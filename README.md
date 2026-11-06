@@ -19,7 +19,7 @@ tty, свой шелл. Без Arduino и без FreeRTOS.
 | **Что умеет** | [`docs/FUNCTIONALITY.md`](docs/FUNCTIONALITY.md) |
 | **Порядок работ** | [`docs/ROADMAP.md`](docs/ROADMAP.md) |
 | **Что сделано и почему** | [`docs/JOURNAL.md`](docs/JOURNAL.md) |
-| **Состояние** | A0–A3 закрыты (06.11.2026): своя точка входа, консоль, время, паника, таблица векторов и карта памяти; текст 53×17 с кириллицей и прокруткой; ввод с мака через `tty` (канон и raw, `Backspace` по UTF-8, зеркало в USB, G0 как `Ctrl-C`); шелл с редактированием строки, историей, разбором с кавычками и командами `help`/`top`/`free`/`date`. Дальше — A4, SD и FAT32 |
+| **Состояние** | A0–A3 закрыты (06.11.2026): своя точка входа, консоль, время, паника, таблица векторов и карта памяти; текст 53×17 с кириллицей и прокруткой; ввод с мака через `tty` (канон и raw, `Backspace` по UTF-8, зеркало в USB, G0 как `Ctrl-C`); шелл с редактированием строки, историей, разбором с кавычками и командами `help`/`top`/`free`/`date`. Хранилище — **встроенный flash 16 МБ** (SD-карты в проекте нет и не будет, решение 06.11.2026): свой драйвер flash, своя таблица разделов и **своя ФС `BFS`** с копированием при записи (COW), проверенная на живой плате (`make fs`). Дальше — A9: VFS и команды над файлами |
 
 ## Плата, на которую проект переехал
 
@@ -88,6 +88,7 @@ make verify          # то же, что CI: тесты, все env, прове�
 | `make monitor` | интерактивный монитор, только живой терминал | да |
 | `make smoke [ENV=…]` | залить и сверить лог с «признаком успеха» | да |
 | `make probe` | залить щуп и прочитать замеры PSRAM и heap | да |
+| `make fs` | залить щуп файловой системы BFS | да |
 | `make test` | тесты на маке (Unity) | нет |
 | `make check [ENV=…]` | проверить образ по символам | нет |
 | `make verify` | тесты, сборка всех env, проверка образов | нет |
@@ -124,7 +125,8 @@ make verify          # то же, что CI: тесты, все env, прове�
 - точка входа и линкер-скрипт, таблица векторов, `arch/xtensa`;
 - консоль USB Serial/JTAG по регистрам, тик на SYSTIMER, своя паника;
 - tty с ANSI, шелл, редактор;
-- VFS и FAT32 (решение о замене на FatFs — в роадмапе, A4);
+- файловая система во flash (A9): драйвер flash, таблица разделов, ФС `BFS`
+  с копированием при записи; дальше VFS и команды;
 - планировщик и переключение контекста на Xtensa.
 
 **Что берём готовым и почему:** драйвер экрана — через `esp_lcd`, потому что
@@ -157,17 +159,19 @@ basalt-os-mini/
 ├── AGENTS.md                правила этого репозитория
 ├── Makefile                 короткие имена команд: make help
 ├── .clangd                  пути xtensa-тулчейна
-├── platformio.ini           [base] + env: tdisplay, tdisplay-panic, probe, lcd, text, tty, shell, bare, bare-panic, console, hello, bringup, native
+├── platformio.ini           [base] + env: tdisplay, tdisplay-panic, probe, lcd, text, tty, shell, flash, fs, bare, bare-panic, console, hello, bringup, native
+├── partitions.csv           своя таблица разделов: 2 МБ приложению, 14 МБ данным
 ├── ld/memory.ld             карта памяти приложения (своя, не из IDF)
 ├── boards/tdisplay_s3/      board_pins.h основной платы
 ├── boards/cardputer/        board_pins.h Cardputer (уезжает в capsh)
 ├── docs/
 ├── tty/                     line discipline: канон и raw, эхо, Backspace, Ctrl-C/D
 ├── shell/                   шелл: история, редактор строки, разбор на слова
+├── storage/                 хранилище: разбор таблицы разделов, своя ФС BFS, дальше VFS
 ├── tools/                   serial-read, flash-backup, check-image, smoke, reset
 ├── test/                    хостовые тесты (Unity)
 ├── src/                     точки входа env'ов + CMakeLists с выбором платы
-├── arch/xtensa/             старт, векторы, паника, консоль, тик, индикатор
+├── arch/xtensa/             старт, векторы, паника, консоль, тик, индикатор, куча, flash
 └── .github/workflows/       CI: сборка всех env и тесты
 ```
 

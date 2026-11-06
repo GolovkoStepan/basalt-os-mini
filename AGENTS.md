@@ -26,7 +26,11 @@ basalt-os-mini/
 ├── README.md            что за система и почему
 ├── Makefile             короткие имена команд: make help
 ├── .clangd              пути xtensa-тулчейна
-├── platformio.ini       [base] + env: tdisplay, tdisplay-panic, probe, lcd, text, tty, shell, bare, bare-panic, console, hello, bringup, native
+├── platformio.ini       [base] + env: tdisplay, tdisplay-panic, probe, lcd, text, tty, shell, flash, fs, bare, bare-panic, console, hello, bringup, native
+├── CMakeLists.txt       выбор файлов умолчаний sdkconfig по плате
+├── partitions.csv       своя таблица разделов: 2 МБ приложению, 14 МБ данным
+├── sdkconfig.defaults   конфиг IDF, общий для плат
+├── sdkconfig.defaults.<плата>  то, что различается: размер flash (16 МБ / 8 МБ)
 ├── boards/
 │   ├── tdisplay_s3/     board_pins.h основной платы
 │   └── cardputer/       board_pins.h Cardputer (уезжает в capsh)
@@ -45,7 +49,8 @@ basalt-os-mini/
 ├── text/                текстовая матрица 53×17, UTF-8 и сгенерированный шрифт
 ├── tty/                 line discipline: канон и raw, эхо, Backspace, Ctrl-C/D
 ├── shell/               шелл: история, редактор строки, разбор на слова
-└── arch/xtensa/         старт, стек, куча, векторы, паника, консоль, тик, индикатор
+├── storage/             хранилище: разбор таблицы разделов, своя ФС BFS, дальше VFS
+└── arch/xtensa/         старт, стек, куча, векторы, паника, консоль, тик, индикатор, flash
 ```
 
 `docs/board.md` — **единственный** документ основной платы. Копий в других
@@ -153,6 +158,8 @@ make                             # собрать env:tdisplay
 make verify                      # то же, что CI: тесты, все env, образы
 make flash ENV=bare              # собрать и залить Cardputer
 make probe                       # щуп: чип, flash, PSRAM, кадровый буфер в PSRAM
+make flash ENV=flash             # щуп flash: ID чипа, таблица разделов, чтение, стирание, запись
+make fs                          # щуп ФС: разметка, запись, чтение, перемонтирование
 make log SECONDS=30              # читать лог 30 секунд
 ```
 
@@ -188,7 +195,7 @@ pyserial из PlatformIO). Иначе порт просто не откроет�
 
 | Уровень | Чем | Что проверяет | Где запускается |
 |---|---|---|---|
-| логика на маке | `pio test -e native` (Unity) | переносимый код: форматирование, позже tty, парсер шелла, FAT32 | `test/`, CI |
+| логика на маке | `pio test -e native` (Unity) | переносимый код: форматирование, текст, tty, парсер шелла, таблица разделов, ФС BFS, дальше VFS | `test/`, CI |
 | собранный образ | `./tools/check-image.sh` | то, чего не видит компилятор: карта памяти своя, таблица векторов выровнена на 1 КБ, куча внутри DRAM | CI |
 | живая плата | `./tools/smoke.sh <env>` | лог: `ready`, тики до `tick 20`, отчёт паники, причина сброса | вручную, плата в порту |
 
@@ -400,18 +407,20 @@ newlib** — clangd находит его по старой привычке и 
 | Порт не появился | кабель «только зарядка» | data-кабель |
 | Сборка **любого** env падает на `pydantic-core` / `No module named 'idf_component_manager'`, CMake ругается на `project()` | PlatformIO на Python 3.15 пересоздал окружение IDF, а собрать в него зависимости не смог | PIO на Python ≤ 3.14 через `~/.venvs/pio314`, см. раздел 3 |
 | `pio run` собирает не тот env | `default_envs` теперь `tdisplay` | явно `-e bare` для Cardputer |
-| Правка `sdkconfig.defaults` не подействовала | PlatformIO держит рядом готовый `sdkconfig.<env>` и копирует defaults только если тот старше | удалить `sdkconfig.<env>` (в `.gitignore`) и пересобрать |
+| Правка `sdkconfig.defaults` или `sdkconfig.defaults.<плата>` не подействовала | PlatformIO держит рядом готовый `sdkconfig.<env>` и копирует defaults только если тот старше; за файлом платы он вообще не следит — тот подключён из `CMakeLists.txt` | удалить `sdkconfig.<env>` (в `.gitignore`) и пересобрать |
 | `Could not open /dev/cu.usbmodem…: port is busy` при заливке | порт держит открытый `pio device monitor`; `serial-read.sh` держит его только пока читает | закрыть монитор и повторить заливку |
 | `Ctrl-C` в `pio device monitor` закрывает монитор, а плата не реагирует | байт `0x03` перехватывает сам монитор, до USB-JTAG он не доходит | кнопка **G0** (в `env:tty` она отдаёт `Ctrl-C`) или `screen /dev/cu.usbmodem… 115200`, где `^C` проходит |
 | При наборе текста чёрточки под первым символом каждой строки | курсор рисовался в полосе любой перерисовываемой строки, а не только своей | `row == s_row` в `text_render_row`; тест `test_cursor_only_on_its_row` |
-| `Warning! Flash memory size mismatch detected. Expected 16MB, found 2MB!` на каждой сборке espidf | `board_build.flash_size` в `platformio.ini` для espidf задаёт только загрузку; размер в образе и таблице разделов берётся из `CONFIG_ESPTOOLPY_FLASHSIZE` в `sdkconfig.<env>`, а там дефолт IDF — 2 МБ | сейчас безвредно (приложение в 1 МБ, весь образ 182 КБ). Станет важно на A9: под ФС нужен `CONFIG_ESPTOOLPY_FLASHSIZE_16MB` в `sdkconfig.defaults` и своя таблица разделов. Флеш физически 16 МБ — это проверено (`docs/board.md` §10 п.1) |
+| `Warning! Flash memory size mismatch detected. Expected 16MB, found 2MB!` на каждой сборке espidf | `board_build.flash_size` в `platformio.ini` для espidf задаёт только загрузку; размер в образе и таблице разделов берётся из `CONFIG_ESPTOOLPY_FLASHSIZE` в `sdkconfig.<env>`, а там дефолт IDF — 2 МБ | **исправлено 06.11.2026**: `CONFIG_ESPTOOLPY_FLASHSIZE_16MB` в `sdkconfig.defaults.tdisplay` (у Cardputer — `8MB` в `sdkconfig.defaults.cardputer`), файл платы подключает `CMakeLists.txt`. Проверка: `esptool image-info .pio/build/tdisplay/firmware.bin` печатает `Flash size: 16MB`, а `pio run -e tdisplay` больше не ругается |
+| `SDKCONFIG_DEFAULTS=файл1;файл2` в `platformio.ini` не работает | в INI «;» — начало комментария, значение обрезается до первого разделителя | список файлов умолчаний задаётся в `CMakeLists.txt`, а не в `platformio.ini` |
 | `lvalue required as left operand of assignment` на `GPIO_OUT1_W1TS_REG = …` | в IDF это адрес регистра, а не переменная | `REG_WRITE(GPIO_OUT1_W1TS_REG, …)`; то же для `SET_PERI_REG_*` |
 | После сброса на экране виден текст прошлой сессии, будто состояние восстановилось | панель ST7789 хранит кадр в своей памяти, пока на ней есть питание, а прошивка первые 2 с панель не трогает (пауза, чтобы хост открыл порт) | `lcd_init` + `text_init` + `present_dirty()` **до** паузы; тогда экран гаснет сразу и сброс видно глазами |
 | Паника печатает `причина 29: неизвестная` при разыменованном NULL | в таблице причин не было 28 и 29 | дописать: 28 — чтение, 29 — запись по недопустимому адресу. Проверено командой `crash` |
 | В `make monitor` после каждой буквы видно `␛[K`, а `Delete` печатает `␇` | `pio device monitor` по умолчанию применяет фильтр `default` (`NoTerminal` из pyserial): управляющие символы заменяются «картинками» Unicode — ESC → `␛`, BEL → `␇`. Шелл шлёт в зеркало настоящие `\x1b[K` и `\b`, и фильтр их портит | `monitor_filters = direct` в `[base]` `platformio.ini`: вывод идёт в терминал без преобразований. Плата и `tools/serial-read.sh` тут ни при чём — порча происходит на маке |
 | После каждой команды в терминале лишняя пустая строка и второе приглашение | `pio device monitor` с EOL=CRLF шлёт на Enter **пару** `\r\n`, а tty считал CR и LF двумя концами строки | `tty_input` съедает LF сразу за CR: Enter — одно нажатие. Тесты `test_canon_crlf_is_one_enter`, `test_raw_crlf_is_one_enter`. Проверено на плате 06.11.2026 |
 | Изображение на экране — дополнение до белого (синее жёлтым) | стекло IPS требует `INVON` | `DISP_INVERT_COLORS = 1` в `board_pins.h`, подробности — `docs/board.md` §4 |
-| `heap_caps_*` возвращает 0, `malloc` не работает, `esp_flash_get_size(NULL)` даёт ошибку | при своём старте не выполняется `do_core_init()` IDF, а в нём живут `ESP_SYSTEM_INIT_FN`: куча (100), PSRAM в куче (103), драйвер flash (130) | завести в `arch/xtensa/`, см. `heap.c` (куча уже заводится), flash — по мере надобности; JOURNAL от 06.11.2026 |
+| `heap_caps_*` возвращает 0, `malloc` не работает, `esp_flash_get_size(NULL)` даёт ошибку | при своём старте не выполняется `do_core_init()` IDF, а в нём живут `ESP_SYSTEM_INIT_FN`: куча (100), PSRAM в куче (103), драйвер flash (130) | заводится в `arch/xtensa/`: `heap.c` — куча, `flash.c` — драйвер flash (`basalt_flash_init`, проверен щупом `env:flash` 06.11.2026); JOURNAL от 06.11.2026 |
+| `basalt_flash_read/write` возвращает `ESP_ERR_NO_MEM`, хотя память есть | драйвер flash работает в режиме no-OS: на время операции он гасит кэш, а PSRAM доступна только через кэш. Временный буфер в этом режиме не выделяется | буфер операции держать в SRAM (`MALLOC_CAP_INTERNAL`); PSRAM — только для того, что в самой операции не участвует |
 | Двойное исключение сразу после первого `heap_caps_*` при старте, `EXCVADDR 0xffffffe0`, `A1` равен `basalt_stack_top`, `EPC1` в консоли | `heap_caps_init()` вызвана на стеке загрузчика: она оставляет в списке куч область под этим стеком, и первое же обращение к ней ломает чужие кадры | звать кучу только из `basalt_start_c()`, куда управление приходит после `movi a1, basalt_stack_top` в `start.S` |
 | `*** [/Users/tmp] /Users/tmp: Permission denied` на шаге линкер-скрипта | `PLATFORMIO_CORE_DIR` указывает внутрь `/tmp`: SCons склеивает путь и теряет первый уровень | держать каталог вне `/tmp`, например `~/pio-clean` |
 
@@ -447,8 +456,10 @@ newlib** — clangd находит его по старой привычке и 
   а полный буфер — это 900 глифов поштучно в память через кэш. Правило простое:
   буфер в PSRAM заводится под то, что рисуется областями (графика, A12), а не
   под то, что можно нарисовать построчно.
-- **Таблица разделов по умолчанию даёт 1 МБ под приложение** из 16 МБ flash.
-  Под файловую систему нужна своя (`board_build.partitions`), см. веху A9.
+- **Таблица разделов своя** (`partitions.csv`, с 06.11.2026): приложение 2 МБ,
+  раздел данных `storage` 14 272 КБ, служебные разделы IDF 28 КБ. Flash
+  поделён весь, свободного места вне разделов нет. Размер flash в заголовке
+  образа задаётся не в `platformio.ini`, а в `sdkconfig.defaults.<плата>`.
 - Бюджет памяти — в `docs/FUNCTIONALITY.md`, раздел 13.
 
 Перед тем как закладывать крупный буфер, замерить фактический свободный блок:

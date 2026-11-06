@@ -42,6 +42,9 @@ set(BASALT_TTY_INC "")
 set(BASALT_BUTTON_SRC "")
 set(BASALT_SHELL_SRC "")
 set(BASALT_SHELL_INC "")
+set(BASALT_FLASH_SRC "")
+set(BASALT_STORAGE_SRC "")
+set(BASALT_STORAGE_INC "")
 
 if(BASALT_APP_PROBE)
     set(BASALT_APP_SRC "probe/main.c")
@@ -89,6 +92,29 @@ elseif(BASALT_APP_SHELL)
         "../shell/lineedit.c"
     )
     set(BASALT_SHELL_INC "../shell")
+elseif(BASALT_APP_FLASH)
+    # Щуп встроенного flash: тот же старт и та же консоль, но свой main.c и
+    # драйвер flash. Драйвер подключается только здесь: пока он нужен одному
+    # щупу, проверенные сборки A0 не должны расти мёртвым кодом. В A9, когда
+    # без него не соберётся ни один env с файлами, строка переедет в общий
+    # список.
+    set(BASALT_APP_SRC "flash/main.c")
+    set(BASALT_FLASH_SRC "../arch/xtensa/flash.c")
+    # Разбор таблицы разделов нужен и щупу, и будущей ФС. Модуль переносимый
+    # (только байты), поэтому он же проверяется на маке - test/test_parttable.
+    set(BASALT_STORAGE_SRC "../storage/parttable.c")
+    set(BASALT_STORAGE_INC "../storage")
+elseif(BASALT_APP_FS)
+    # Щуп файловой системы: драйвер flash, разбор таблицы разделов и сама BFS.
+    # Отдельная ветка, потому что здесь впервые встречаются все три слоя, и
+    # именно она проверяет на железе то, что тесты проверяют на маке.
+    set(BASALT_APP_SRC "fs/main.c")
+    set(BASALT_FLASH_SRC "../arch/xtensa/flash.c")
+    set(BASALT_STORAGE_SRC
+        "../storage/parttable.c"
+        "../storage/bfs.c"
+    )
+    set(BASALT_STORAGE_INC "../storage")
 else()
     set(BASALT_APP_SRC "bare/main.c")
 endif()
@@ -112,6 +138,8 @@ idf_component_register(
         ${BASALT_TTY_SRC}
         ${BASALT_BUTTON_SRC}
         ${BASALT_SHELL_SRC}
+        ${BASALT_FLASH_SRC}
+        ${BASALT_STORAGE_SRC}
     INCLUDE_DIRS
         "../arch/xtensa/include"
         "../drivers"
@@ -119,4 +147,5 @@ idf_component_register(
         ${BASALT_TEXT_INC}
         ${BASALT_TTY_INC}
         ${BASALT_SHELL_INC}
+        ${BASALT_STORAGE_INC}
 )
