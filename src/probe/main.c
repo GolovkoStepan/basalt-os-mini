@@ -22,8 +22,6 @@
 
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
-#include "esp_heap_caps_init.h"
-#include "esp_private/esp_psram_extram.h"
 #include "esp_psram.h"
 #include "esp_rom_spiflash.h"
 #include "sdkconfig.h"
@@ -59,30 +57,26 @@ static void put_size_kib(size_t bytes)
     basalt_put(" КБ");
 }
 
-// Завести кучу. В проекте её до сих пор не заводил никто.
+// Проверка, что кучу завела ОС, а не щуп.
 //
-// heap_caps_init() и добавление PSRAM в кучу - это ESP_SYSTEM_INIT_FN с
-// приоритетами 100 и 103, а вызывает их do_core_init() из start_cpu0_default,
-// то есть функция IDF, которую мы перекрыли своим start_cpu0 (arch/xtensa/
-// start.c). A0 это не мешало: там всё на статических буферах. Кадровому
-// буферу heap_caps нужен, поэтому щуп делает эти два вызова сам - ровно те же
-// и в том же порядке, что IDF.
-//
-// Место для этого вызова в самой ОС - вопрос вехи A1, а не щупа: сейчас щуп
-// отвечает только на вопрос «помещается ли кадр», и отвечать должен честно.
-// Пока вызов живёт здесь, любой другой env по-прежнему живёт без кучи, и это
-// надо помнить.
-static void probe_heap_init(void)
+// До 06.11.2026 щуп делал heap_caps_init() сам: при своём старте её никто не
+// вызывал. Теперь это делает basalt_heap_init() в start_cpu0, и щуп обязан
+// убедиться, что она действительно есть, - иначе «кадровый буфер помещается»
+// будет утверждением про щуп, а не про систему.
+static void report_heap_init(void)
 {
-    heap_caps_init();
+    basalt_put("[probe] куча: ");
+    if (heap_caps_get_total_size(MALLOC_CAP_INTERNAL) == 0) {
+        // Сюда попадать нельзя: если это случилось, значит вызов уехал из
+        // start_cpu0 или его обошли. Печатаем прямо, без смягчений.
+        basalt_put("НЕ ЗАВЕДЕНА - проверить basalt_heap_init в arch/xtensa/start.c\n");
+        return;
+    }
 
-    // Без PSRAM этот вызов вернёт ошибку; на T-Display-S3 её быть не должно,
-    // но результат печатаем, а не глотаем: «куча есть» и «куча вместе с PSRAM»
-    // - разные утверждения.
-    const esp_err_t psram_heap = esp_psram_extram_add_to_heap_allocator();
-
-    basalt_put("[probe] куча: heap_caps_init выполнен, PSRAM в куче ");
-    basalt_put(psram_heap == ESP_OK ? "есть" : "НЕТ");
+    // Отвечаем по факту, а не по коду возврата: важно не «вызов не ругнулся»,
+    // а «в куче действительно есть область с признаком SPIRAM».
+    basalt_put("заведена, PSRAM в куче ");
+    basalt_put(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0 ? "есть" : "НЕТ");
     basalt_put("\n");
 }
 
@@ -258,7 +252,7 @@ void basalt_main(void)
         basalt_put("\n");
     }
 
-    probe_heap_init();
+    report_heap_init();
 
     report_heap("heap SRAM", MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     report_heap("heap DMA", MALLOC_CAP_DMA);

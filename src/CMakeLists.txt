@@ -20,16 +20,21 @@
 if(BASALT_BOARD_TDISPLAY)
     set(BASALT_INDICATOR_SRC "../arch/xtensa/indicator_backlight.c")
     set(BASALT_BOARD_DIR     "../boards/tdisplay_s3")
+    set(BASALT_LCD_SRC       "../drivers/lcd_i80.c")
 else()
     set(BASALT_INDICATOR_SRC "../arch/xtensa/indicator_ws2812.c")
     set(BASALT_BOARD_DIR     "../boards/cardputer")
+    set(BASALT_LCD_SRC       "")
 endif()
 
-# Приложение тоже выбирается сборкой: env:probe - тот же старт и та же консоль,
-# но другой main.c. Второй копии arch/ при этом не появляется, и ни один общий
-# файл не обрастает ветвлениями «а в щупе иначе»: различие ровно в одном файле.
+# Приложение тоже выбирается сборкой: env:probe и env:lcd - тот же старт и та
+# же консоль, но другой main.c. Второй копии arch/ при этом не появляется, и ни
+# один общий файл не обрастает ветвлениями «а в щупе иначе»: различие ровно в
+# одном файле.
 if(BASALT_APP_PROBE)
     set(BASALT_APP_SRC "probe/main.c")
+elseif(BASALT_APP_LCD)
+    set(BASALT_APP_SRC "lcd/main.c")
 else()
     set(BASALT_APP_SRC "bare/main.c")
 endif()
@@ -46,7 +51,10 @@ idf_component_register(
         "../arch/xtensa/vectors.S"
         "../arch/xtensa/start.c"
         "../arch/xtensa/start.S"
+        "../arch/xtensa/heap.c"
+        ${BASALT_LCD_SRC}
     INCLUDE_DIRS
         "../arch/xtensa/include"
+        "../drivers"
         ${BASALT_BOARD_DIR}
 )

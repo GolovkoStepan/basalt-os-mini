@@ -4,6 +4,8 @@
 
 #include "start.h"
 
+#include "heap.h"
+
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
 
@@ -45,7 +47,23 @@ static void rtc_wdt_disable(void)
 void start_cpu0(void)
 {
     rtc_wdt_disable();
+
     basalt_start();
+}
+
+// Своя C-часть старта, уже на своём стеке. Вызывается из basalt_start (start.S)
+// ровно затем, чтобы «что делать до приложения» было написано на C, а порядок
+// «сначала стек, потом куча» держался одной строкой ассемблера, а не
+// соглашением между файлами.
+void basalt_start_c(void) __attribute__((noreturn));
+
+void basalt_start_c(void)
+{
+    // Куча - до всего остального: любой драйвер выделяет память. Забыть этот
+    // вызов легко: без него код собирается, а падает потом и в другом месте.
+    basalt_heap_init();
+
+    basalt_main();
 }
 
 void start_cpu_other_cores(void)
