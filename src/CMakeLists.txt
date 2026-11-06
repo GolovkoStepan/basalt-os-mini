@@ -44,7 +44,11 @@ elseif(BASALT_APP_LCD)
     set(BASALT_APP_SRC "lcd/main.c")
 elseif(BASALT_APP_TEXT)
     set(BASALT_APP_SRC "text/main.c")
-    set(BASALT_TEXT_SRC "../text/matrix.c")
+    set(BASALT_TEXT_SRC
+        "../text/matrix.c"
+        "../text/utf8.c"
+        "../text/font_5x7.c"
+    )
     set(BASALT_TEXT_INC "../text")
 else()
     set(BASALT_APP_SRC "bare/main.c")

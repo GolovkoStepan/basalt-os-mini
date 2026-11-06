@@ -6,11 +6,19 @@
 #include <string.h>
 
 #include "font_5x7.h"
+#include "utf8.h"
 
-// Клетки символов. Один байт на клетку, а не пиксели: экран 320x170 - это
-// 108 800 Б кадра, а сетка символов - 901 Б. Перерисовывается в пиксели
-// только то, что помечено изменённым.
-static char s_cells[TEXT_ROWS][TEXT_COLS];
+
+// Клетки символов: по code point на клетку. 17*53*2 = 1802 Б против 108 800 Б
+// кадра - сетку дешевле двигать, чем пиксели. Ноль означает пустую клетку и
+// заодно служит значением по умолчанию после memset: сам символ с кодом 0
+// (NUL) в клетку не попадает - это управляющий байт, а не глиф.
+static uint16_t s_cells[TEXT_ROWS][TEXT_COLS];
+
+// Состояние разбора UTF-8 живёт здесь, а не в декодере: недособранная буква
+// принадлежит этому экрану. Когда появится второй поток (A2), у него будет
+// свой декодер, и символы двух потоков не склеятся.
+static utf8_decoder s_utf8;
 
 static int s_col;
 static int s_row;
@@ -32,7 +40,8 @@ static void mark_dirty(int row)
 
 static void clear_cells(void)
 {
-    memset(s_cells, ' ', sizeof(s_cells));
+    memset(s_cells, 0, sizeof(s_cells));
+    utf8_reset(&s_utf8);
     s_col = 0;
     s_row = 0;
     s_cursor = false;
@@ -64,14 +73,14 @@ void text_set_colors(uint16_t fg, uint16_t bg)
     }
 }
 
-// Прокрутка на строку вверх. Прокручивается сетка символов (901 Б), а не
+// Прокрутка на строку вверх. Прокручивается сетка символов (1802 Б), а не
 // пиксели: пиксели всё равно придётся рисовать заново целиком, так дешевле.
 static void scroll_up(void)
 {
     for (int r = 1; r < TEXT_ROWS; ++r) {
-        memcpy(s_cells[r - 1], s_cells[r], TEXT_COLS);
+        memcpy(s_cells[r - 1], s_cells[r], sizeof(s_cells[0]));
     }
-    memset(s_cells[TEXT_ROWS - 1], ' ', TEXT_COLS);
+    memset(s_cells[TEXT_ROWS - 1], 0, sizeof(s_cells[0]));
 
     for (int r = 0; r < TEXT_ROWS; ++r) {
         s_dirty[r] = true;
@@ -92,18 +101,23 @@ static void newline(void)
     mark_dirty(s_row);
 }
 
-static void put_byte(char c)
+void text_put_cp(uint32_t cp)
 {
-    // Вне печатного диапазона шрифта нет. Пропускаем молча, а не рисуем
-    // заглушку: заглушка на каждом байте испортила бы вывод UTF-8, который
-    // придёт сюда, когда появится кириллица, - и было бы не понять, где
-    // кончается шрифт, а где начинается приём.
-    const unsigned char u = (unsigned char)c;
-    if (u < 0x20 || u > 0x7E) {
+    // Управляющие коды - команды, а не символы. Сюда они приходят только
+    // байтами потока (text_putc разбирает \n, \r, \b и \t сам), и глифа у
+    // них нет: молча пропускаем.
+    if (cp < 0x20 || cp == 0x7F) {
         return;
     }
 
-    s_cells[s_row][s_col] = c;
+    // Символ настоящий, но глифа нет: за пределами ASCII и кириллицы шрифт
+    // пуст. Рисуем '?' - пустая клетка выглядела бы как пропавшая буква при
+    // живом потоке, и было бы не понять, где кончается шрифт.
+    if (font_glyph(cp) == NULL) {
+        cp = '?';
+    }
+
+    s_cells[s_row][s_col] = (uint16_t)cp;
     mark_dirty(s_row);
 
     ++s_col;
@@ -114,7 +128,17 @@ static void put_byte(char c)
 
 void text_putc(char c)
 {
-    switch (c) {
+    const uint8_t byte = (uint8_t)c;
+
+    // Управляющий байт означает возврат к командам: недособранная буква после
+    // него не продолжится. Держать её состояние опасно - следующий 0xB0
+    // склеился бы со старой головкой, и на экране появилась бы буква из
+    // воздуха.
+    if (byte < 0x20 || byte == 0x7F) {
+        utf8_reset(&s_utf8);
+    }
+
+    switch (byte) {
     case '\n':
         newline();
         break;
@@ -138,12 +162,24 @@ void text_putc(char c)
         // символа идёт через ту же дорогу, что и всё остальное, включая
         // возможный перенос.
         do {
-            put_byte(' ');
+            text_put_cp(' ');
         } while (s_col % 8 != 0);
         break;
 
     default:
-        put_byte(c);
+        if (byte < 0x80) {
+            // ASCII мимо декодера, но состояние всё равно сбрасываем: буква
+            // посреди недособранной последовательности означает, что та битая.
+            utf8_reset(&s_utf8);
+            text_put_cp(byte);
+        } else {
+            uint32_t cp = 0;
+            // PENDING - буква ещё не собрана; INVALID - байт выброшен и
+            // курсор двигать не за что.
+            if (utf8_feed(&s_utf8, byte, &cp) == UTF8_DONE) {
+                text_put_cp(cp);
+            }
+        }
         break;
     }
 
@@ -236,12 +272,18 @@ void text_render_row(int row, uint16_t* dst)
     // обратного чтения, и стереть неверно нарисованное можно только заливкой
     // фона, то есть тем же, что уже сделано выше.
     for (int col = 0; col < TEXT_COLS; ++col) {
-        const unsigned char ch = (unsigned char)s_cells[row][col];
-        if (ch < FONT_FIRST_CODE || ch >= FONT_FIRST_CODE + FONT_GLYPH_COUNT) {
+        const uint16_t cp = s_cells[row][col];
+        if (cp == 0) {
             continue;
         }
 
-        const uint8_t* glyph = kFont5x7[ch - FONT_FIRST_CODE];
+        const uint8_t* glyph = font_glyph(cp);
+        if (glyph == NULL) {
+            // В клетку такое попасть не может: text_put_cp подменяет символ
+            // без глифа на '?'. Проверка на случай, если клетку однажды начнут
+            // писать в обход text_put_cp.
+            continue;
+        }
         const int base_x = TEXT_MARGIN_X + col * TEXT_CELL_W;
 
         for (int gy = 0; gy < TEXT_GLYPH_H; ++gy) {

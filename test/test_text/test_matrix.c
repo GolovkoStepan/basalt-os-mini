@@ -268,6 +268,91 @@ static void test_margins_filled_with_background(void)
     }
 }
 
+// --- кириллица и UTF-8 ---
+
+// Два байта UTF-8 - один символ и одна клетка. Если бы клетка считалась на
+// байт, «А» заняла бы две, и весь текст после неё поехал бы вправо.
+static void test_cyrillic_takes_one_cell(void)
+{
+    text_puts("\xD0\x90");  // «А»
+    TEST_ASSERT_EQUAL_INT(1, text_cursor_col());
+}
+
+// Буква доехала до клетки и нарисовалась: у «А» верхний пиксель средней
+// колонки и вся средняя строка — поперечина.
+static void test_cyrillic_glyph_drawn(void)
+{
+    text_puts("\xD0\x90");
+    render(0);
+
+    const int x = cell_x(0);
+    TEST_ASSERT_EQUAL_HEX16(FG, pixel(x + 2, TEXT_GLYPH_DY + 0));
+    for (int gx = 0; gx < TEXT_GLYPH_W; ++gx) {
+        TEST_ASSERT_EQUAL_HEX16(FG, pixel(x + gx, TEXT_GLYPH_DY + 4));
+    }
+    // В нижней строке ноги по краям, в середине пусто - иначе это была бы не
+    // «А», а сплошной прямоугольник.
+    TEST_ASSERT_EQUAL_HEX16(BG, pixel(x + 2, TEXT_GLYPH_DY + 6));
+}
+
+// Символ без глифа (эмодзи) рисуется как '?'. Пустая клетка выглядела бы как
+// пропавшая буква, и было бы не понять, где кончается шрифт.
+static void test_unknown_glyph_becomes_question(void)
+{
+    text_puts("\xF0\x9F\x98\x80");  // U+1F600
+    TEST_ASSERT_EQUAL_INT(1, text_cursor_col());
+
+    render(0);
+    const int x = cell_x(0);
+    // У '?' верхняя строка — «.###.», то есть средние три пикселя.
+    TEST_ASSERT_EQUAL_HEX16(BG, pixel(x + 0, TEXT_GLYPH_DY));
+    TEST_ASSERT_EQUAL_HEX16(FG, pixel(x + 1, TEXT_GLYPH_DY));
+    TEST_ASSERT_EQUAL_HEX16(FG, pixel(x + 3, TEXT_GLYPH_DY));
+}
+
+// Битый байт не двигает курсор и не стирает соседей: следующий нормальный
+// символ встаёт на его место.
+static void test_invalid_byte_takes_no_cell(void)
+{
+    text_putc((char)0xB0);  // продолжение без головки
+    TEST_ASSERT_EQUAL_INT(0, text_cursor_col());
+
+    text_putc('A');
+    TEST_ASSERT_EQUAL_INT(1, text_cursor_col());
+}
+
+// Управляющий байт обрывает недособранную букву: иначе хвост следующей
+// последовательности склеился бы со старой головкой, и на экране появилась бы
+// буква из воздуха.
+static void test_control_byte_drops_pending(void)
+{
+    text_putc((char)0xD0);   // головка «А», ждём продолжение
+    text_putc('\n');         // и вдруг перевод строки
+    text_putc((char)0x90);   // хвост уже некуда - это не буква
+
+    TEST_ASSERT_EQUAL_INT(0, text_cursor_col());
+    TEST_ASSERT_EQUAL_INT(1, text_cursor_row());
+}
+
+// Заглавная и строчная кириллица должны различаться формой, а не совпадать:
+// именно тут опечатка в генераторе проходит незамеченной.
+static void test_cyrillic_upper_and_lower_differ(void)
+{
+    text_puts("\xD0\x90");  // «А»
+    uint16_t upper[TEXT_STRIP_PIXELS];
+    render(0);
+    memcpy(upper, s_strip, sizeof(upper));
+
+    text_init();
+    text_set_colors(FG, BG);
+    clean_all();
+
+    text_puts("\xD0\xB0");  // «а»
+    render(0);
+
+    TEST_ASSERT_TRUE(memcmp(upper, s_strip, sizeof(upper)) != 0);
+}
+
 // --- dirty-строки ---
 
 static void test_single_char_marks_one_row(void)
@@ -346,6 +431,13 @@ int main(void)
     RUN_TEST(test_space_draws_nothing);
     RUN_TEST(test_glyph_bit_order);
     RUN_TEST(test_margins_filled_with_background);
+
+    RUN_TEST(test_cyrillic_takes_one_cell);
+    RUN_TEST(test_cyrillic_glyph_drawn);
+    RUN_TEST(test_unknown_glyph_becomes_question);
+    RUN_TEST(test_invalid_byte_takes_no_cell);
+    RUN_TEST(test_control_byte_drops_pending);
+    RUN_TEST(test_cyrillic_upper_and_lower_differ);
 
     RUN_TEST(test_single_char_marks_one_row);
     RUN_TEST(test_clean_clears_flag);
