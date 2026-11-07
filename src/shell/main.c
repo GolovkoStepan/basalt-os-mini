@@ -42,6 +42,7 @@
 #include "start.h"
 #include "tick.h"
 #include "int1.h"
+#include "idle.h"
 #include "tty.h"
 #include "utf8.h"
 #include "vectors.h"
@@ -598,6 +599,13 @@ static void cmd_top(int argc, char** argv)
     out_puts(" (");
     out_u64(BASALT_INT1_HZ);
     out_puts(" Гц)\n");
+
+    // Сон главного цикла: раз в тик при простое. Число заметно больше тиков
+    // означало бы, что работу будят чужие прерывания; ноль - что сон не
+    // включён и цикл по-прежнему крутится.
+    out_puts("сон ");
+    out_u64(basalt_idle_waits());
+    out_puts(" раз\n");
     out_puts("SRAM свободно ");
     out_kib(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     out_puts(", PSRAM свободно ");
@@ -645,9 +653,9 @@ static void cmd_sleep(int argc, char** argv)
     out_puts("\n");
     present_dirty();
 
-    const uint64_t until = basalt_uptime_us() + (uint64_t)ms * 1000u;
-    while (basalt_uptime_us() < until) {
-    }
+    // Спит ядро, а не счётчик: до этого шага здесь был цикл опроса, и десять
+    // секунд `sleep` означали десять секунд полной загрузки процессора.
+    basalt_idle_ms(ms);
 
     out_puts("проснулся\n");
 }
@@ -3171,6 +3179,10 @@ void basalt_main(void)
     // последняя строка в логе укажет на него, а не на команду пользователя.
     basalt_int1_init();
 
+    // Сон разрешается сразу после тика: до этого waiti уснул бы навсегда,
+    // потому что разбудить его было бы некому.
+    basalt_idle_init();
+
     basalt_put("[shell] тик ");
     basalt_put_u64(BASALT_INT1_HZ);
     basalt_put(" Гц, ядро ");
@@ -3215,6 +3227,17 @@ void basalt_main(void)
 
         present_dirty();
 
-        basalt_delay_us(500);
+        // Спим до ближайшего тика, а не крутимся на basalt_delay_us(500).
+        //
+        // Сон ограничен частотой тика: 10 мс. USB-прерывание у нас не
+        // разрешено (консоль опрашивается), поэтому разбудить раньше тика
+        // некому - и 10 мс это верхняя граница задержки отклика на клавишу.
+        // Для терминала незаметно, а в простое ядро перестаёт выполнять
+        // миллионы пустых итераций.
+        //
+        // Почему не «спать до следующего мигания курсора»: любое прерывание
+        // возвращает управление, а условие перепроверяется сверху. Спать
+        // ровно до срока бессмысленно - тик всё равно разбудит через 10 мс.
+        basalt_idle_wait();
     }
 }
