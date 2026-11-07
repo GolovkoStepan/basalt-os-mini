@@ -152,6 +152,7 @@ idf_component_register(
         ${BASALT_APP_SRC}
         "../arch/xtensa/console_usb_jtag.c"
         "../arch/xtensa/tick.c"
+        "../arch/xtensa/int1.c"
         ${BASALT_INDICATOR_SRC}
         "../arch/xtensa/format.c"
         "../arch/xtensa/panic.c"

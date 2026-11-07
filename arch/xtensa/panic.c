@@ -29,7 +29,8 @@ _Static_assert(offsetof(basalt_frame_t, exccause) == 72, "кадр: exccause");
 _Static_assert(offsetof(basalt_frame_t, excvaddr) == 76, "кадр: excvaddr");
 _Static_assert(offsetof(basalt_frame_t, sar) == 80, "кадр: sar");
 _Static_assert(offsetof(basalt_frame_t, vector) == 84, "кадр: vector");
-_Static_assert(sizeof(basalt_frame_t) == 88, "кадр: размер");
+_Static_assert(offsetof(basalt_frame_t, depc) == 88, "кадр: depc");
+_Static_assert(sizeof(basalt_frame_t) == 92, "кадр: размер");
 
 // Пауза перед сбросом: чтобы красный успели заметить, а лог - дочитать.
 #define PANIC_HOLD_US 3000000u
@@ -73,7 +74,10 @@ static const char* cause_text(uint32_t cause)
     case 1: return "syscall";
     case 2: return "ошибка при выборке инструкции";
     case 3: return "ошибка при чтении или записи данных";
-    case 4: return "прерывание уровня 1 (сюда попадать не должно)";
+    // 4 - прерывание уровня 1. В норме оно обрабатывается в обработчике
+    // уровня 1 и сюда не доходит; попадание означает, что обработчик не смог
+    // снять источник (например, CCOMPARE0 остался позади CCOUNT).
+    case 4: return "прерывание уровня 1 (обработчик не снял источник)";
     case 5: return "переполнение alloca";
     case 6: return "деление на ноль";
     case 7: return "некорректное значение PC";
@@ -234,6 +238,17 @@ void basalt_panic_exc(basalt_frame_t* frame)
     basalt_put("EPC1     0x");
     basalt_put_hex(frame->pc, 8);
     basalt_put("  адрес инструкции, на которой всё остановилось\n");
+
+    // Двойное исключение - единственный случай, когда EPC1 не про эту
+    // остановку: он остался от первого исключения, а сбой случился внутри
+    // обработчика, и его адрес аппаратура положила в DEPC. Печатать один EPC1
+    // значило бы показать чужую инструкцию - на плате это уже стоило поиска
+    // причины в font_glyph, где её не было.
+    if (frame->vector == BASALT_VECTOR_DOUBLE) {
+        basalt_put("DEPC     0x");
+        basalt_put_hex(frame->depc, 8);
+        basalt_put("  адрес сбоя внутри обработчика (это искать)\n");
+    }
 
     basalt_put("EXCVADDR 0x");
     basalt_put_hex(frame->excvaddr, 8);

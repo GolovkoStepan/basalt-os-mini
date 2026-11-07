@@ -41,6 +41,7 @@
 #include "stack.h"
 #include "start.h"
 #include "tick.h"
+#include "int1.h"
 #include "tty.h"
 #include "utf8.h"
 #include "vectors.h"
@@ -592,7 +593,12 @@ static void cmd_top(int argc, char** argv)
 
     out_puts("uptime ");
     out_u64(basalt_uptime_us() / 1000000u);
-    out_puts(" с, SRAM свободно ");
+    out_puts(" с, тиков ");
+    out_u64(basalt_int1_ticks());
+    out_puts(" (");
+    out_u64(BASALT_INT1_HZ);
+    out_puts(" Гц)\n");
+    out_puts("SRAM свободно ");
     out_kib(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     out_puts(", PSRAM свободно ");
     out_kib(heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -721,6 +727,73 @@ static void cmd_uptime(int argc, char** argv)
     out_puts("аптайм ");
     out_u64(basalt_uptime_us() / 1000000u);
     out_puts(" с\n");
+}
+
+// Проверка частоты тика секундомером, а не на глаз.
+//
+// Зачем отдельная команда: «тики растут» само по себе ничего не доказывает -
+// они будут расти и при периоде втрое больше задуманного. Здесь частота
+// измеряется как (прирост тиков) / (прошедшее время по SYSTIMER), и оба
+// источника независимы: тики идут от CCOUNT (тактовая частота ядра), время -
+// от SYSTIMER (16 МГц). Совпадение с BASALT_INT1_HZ и есть проверка того, что
+// период посчитан по настоящей частоте ядра.
+static void cmd_tickrate(int argc, char** argv)
+{
+    (void)argc;
+    (void)argv;
+
+    const uint32_t ms = 1000;
+
+    out_puts("меряю тик ");
+    out_u64(ms);
+    out_puts(" мс...\n");
+    present_dirty();
+
+    const uint32_t t0 = basalt_int1_ticks();
+    const uint64_t us0 = basalt_uptime_us();
+    while (basalt_uptime_us() - us0 < (uint64_t)ms * 1000u) {
+    }
+    const uint32_t t1 = basalt_int1_ticks();
+    const uint64_t us1 = basalt_uptime_us();
+
+    const uint32_t ticks = t1 - t0;
+    const uint64_t us = us1 - us0;
+    if (us == 0) {
+        out_diag("tickrate: время не идёт\n");
+        return;
+    }
+
+    // Целая часть и десятая доля, без плавающей точки.
+    const uint64_t hz10 = (uint64_t)ticks * 10000000u / us;
+    out_puts("тиков ");
+    out_u64(ticks);
+    out_puts(" за ");
+    out_u64(us / 1000u);
+    out_puts(" мс: ");
+    out_u64(hz10 / 10u);
+    out_puts(".");
+    out_u64(hz10 % 10u);
+    out_puts(" Гц, ожидалось ");
+    out_u64(BASALT_INT1_HZ);
+    out_puts(", период ");
+    out_u64(basalt_int1_period());
+    out_puts(" тактов при ядре ");
+    out_u64(basalt_int1_cpu_hz() / 1000000u);
+    out_puts(" МГц\n");
+
+    basalt_int1_state_view_t v;
+    basalt_int1_view(&v);
+    out_puts("  INTENABLE 0x");
+    out_u64(v.intenable);
+    out_puts(" INTERRUPT 0x");
+    out_u64(v.interrupt);
+    out_puts(" PS 0x");
+    out_u64(v.ps);
+    out_puts("\n  CCOUNT ");
+    out_u64(v.ccount);
+    out_puts(" CCOMPARE0 ");
+    out_u64(v.ccompare);
+    out_puts(v.ccount >= v.ccompare ? " (просит прерывания)\n" : " (ждёт)\n");
 }
 
 static void cmd_mirror(int argc, char** argv)
@@ -2670,6 +2743,7 @@ static const command s_commands[] = {
     {"beep",    cmd_beep,    "писк в терминал"},
     {"clear",   cmd_clear,   "очистить экран"},
     {"uptime",  cmd_uptime,  "время работы"},
+    {"tickrate", cmd_tickrate, "измерить частоту тика"},
     {"mirror",  cmd_mirror,  "on|off: повторять поток в USB"},
     {"reboot",  cmd_reboot,  "перезагрузка"},
     {"crash",   cmd_crash,   "проверить панику"},
@@ -3088,6 +3162,20 @@ void basalt_main(void)
     // /etc/rc выполняется до `ready`: его вывод - часть старта, а не ответ на
     // команду. Если файл пуст или его нет, строк тут не появится.
     fs_run_rc();
+
+    // Таймерное прерывание включается последним, после /etc/rc и перед
+    // ready: с этого момента любой код может быть прерван в любой
+    // инструкции. Всё, что должно было пройти без помех - старт драйверов,
+    // разбор конфигурации, вывод баннера - к этому моменту уже позади.
+    // Проверяем это первым, до `ready`: если прерывание сломает систему,
+    // последняя строка в логе укажет на него, а не на команду пользователя.
+    basalt_int1_init();
+
+    basalt_put("[shell] тик ");
+    basalt_put_u64(BASALT_INT1_HZ);
+    basalt_put(" Гц, ядро ");
+    basalt_put_u64(basalt_int1_cpu_hz() / 1000000u);
+    basalt_put(" МГц\n");
 
     basalt_put("ready\n\n");
 
