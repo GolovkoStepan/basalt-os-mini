@@ -119,6 +119,42 @@ static void mount_fresh(void)
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_mount(&s_fs, &dev));
 }
 
+// Старый вид stat по размеру и типу: большинству тестов время не нужно, и
+// писать в каждом структуру целиком значило бы удлинить их без пользы.
+// Метки времени проверяются отдельным блоком ниже.
+static int stat_size_type(bfs_t* fs, const char* path, uint32_t* size, uint16_t* type)
+{
+    bfs_stat_t st;
+    const int rc = bfs_stat(fs, path, &st);
+    if (rc != BFS_OK) {
+        return rc;
+    }
+    if (size != NULL) {
+        *size = st.size;
+    }
+    if (type != NULL) {
+        *type = st.type;
+    }
+    return BFS_OK;
+}
+
+static int readdir_entry(bfs_t* fs, const char* path, uint32_t index, char* name,
+                         uint16_t* type, uint32_t* size)
+{
+    bfs_stat_t st;
+    const int rc = bfs_readdir(fs, path, index, name, &st);
+    if (rc != BFS_OK) {
+        return rc;
+    }
+    if (type != NULL) {
+        *type = st.type;
+    }
+    if (size != NULL) {
+        *size = st.size;
+    }
+    return BFS_OK;
+}
+
 static void write_text(const char* path, const char* text)
 {
     const uint32_t len = (uint32_t)strlen(text);
@@ -170,7 +206,7 @@ void test_format_then_mount(void)
     mount_fresh();
     uint32_t size = 0xFFFFFFFFu;
     uint16_t type = 0;
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/", &size, &type));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/", &size, &type));
     TEST_ASSERT_EQUAL_UINT16(BFS_TYPE_DIR, type);
     TEST_ASSERT_EQUAL_UINT32(0, size);
 
@@ -201,7 +237,7 @@ void test_create_and_stat(void)
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/rc"));
     uint32_t size = 0xFFFFFFFFu;
     uint16_t type = 0;
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/rc", &size, &type));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/rc", &size, &type));
     TEST_ASSERT_EQUAL_UINT16(BFS_TYPE_FILE, type);
     TEST_ASSERT_EQUAL_UINT32(0, size);
 }
@@ -216,7 +252,7 @@ void test_create_existing_fails(void)
 void test_stat_missing_fails(void)
 {
     mount_fresh();
-    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, bfs_stat(&s_fs, "/nope", NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, stat_size_type(&s_fs, "/nope", NULL, NULL));
 }
 
 void test_write_read_roundtrip(void)
@@ -225,7 +261,7 @@ void test_write_read_roundtrip(void)
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/hello"));
     write_text("/hello", "привет, мир");
     uint32_t size = 0;
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/hello", &size, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/hello", &size, NULL));
     TEST_ASSERT_EQUAL_UINT32(strlen("привет, мир"), size);
 
     char buf[64];
@@ -306,7 +342,7 @@ void test_indirect_blocks(void)
     }
 
     uint32_t size = 0;
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/long", &size, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/long", &size, NULL));
     TEST_ASSERT_EQUAL_UINT32(blocks * BFS_BLOCK_SIZE, size);
 
     // Последний блок адресуется уже через indirect: прямые кончились на 12-м.
@@ -339,7 +375,7 @@ void test_double_indirect_sparse(void)
     TEST_ASSERT_EQUAL_UINT32(sizeof(payload), done);
 
     uint32_t size = 0;
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/sparse", &size, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/sparse", &size, NULL));
     TEST_ASSERT_EQUAL_UINT32(off + sizeof(payload), size);
 
     char buf[sizeof(payload)];
@@ -355,7 +391,7 @@ void test_double_indirect_sparse(void)
 
     // Усечение до нуля освобождает и блок данных, и оба промежуточных.
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_truncate(&s_fs, "/sparse", 0));
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/sparse", &size, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/sparse", &size, NULL));
     TEST_ASSERT_EQUAL_UINT32(0, size);
 }
 
@@ -370,7 +406,7 @@ void test_truncate_shrinks_and_frees(void)
 
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_truncate(&s_fs, "/f", 100));
     uint32_t size = 0;
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/f", &size, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/f", &size, NULL));
     TEST_ASSERT_EQUAL_UINT32(100, size);
 
     uint32_t used_after = 0;
@@ -418,7 +454,7 @@ void test_mkdir_and_nested_create(void)
     mount_fresh();
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_mkdir(&s_fs, "/etc"));
     uint16_t type = 0;
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/etc", NULL, &type));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/etc", NULL, &type));
     TEST_ASSERT_EQUAL_UINT16(BFS_TYPE_DIR, type);
 
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/etc/rc"));
@@ -448,16 +484,16 @@ void test_readdir_skips_tombstones(void)
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_unlink(&s_fs, "/b"));
 
     char name[BFS_NAME_MAX + 1];
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_readdir(&s_fs, "/", 0, name, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, readdir_entry(&s_fs, "/", 0, name, NULL, NULL));
     TEST_ASSERT_EQUAL_STRING("a", name);
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_readdir(&s_fs, "/", 1, name, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, readdir_entry(&s_fs, "/", 1, name, NULL, NULL));
     TEST_ASSERT_EQUAL_STRING("c", name);
-    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, bfs_readdir(&s_fs, "/", 2, name, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, readdir_entry(&s_fs, "/", 2, name, NULL, NULL));
 
     // Освободившееся место переиспользуется: новый файл встаёт на место "b",
     // и порядок обхода снова a, b(новый), c.
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/d"));
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_readdir(&s_fs, "/", 1, name, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, readdir_entry(&s_fs, "/", 1, name, NULL, NULL));
     TEST_ASSERT_EQUAL_STRING("d", name);
 }
 
@@ -523,7 +559,7 @@ void test_rmdir_non_empty_fails(void)
 
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_unlink(&s_fs, "/etc/rc"));
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_rmdir(&s_fs, "/etc"));
-    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, bfs_stat(&s_fs, "/etc", NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, stat_size_type(&s_fs, "/etc", NULL, NULL));
 }
 
 void test_rename_same_dir(void)
@@ -532,7 +568,7 @@ void test_rename_same_dir(void)
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/old"));
     write_text("/old", "data");
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_rename(&s_fs, "/old", "/new"));
-    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, bfs_stat(&s_fs, "/old", NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, stat_size_type(&s_fs, "/old", NULL, NULL));
 
     char buf[8];
     uint32_t done = 0;
@@ -550,9 +586,9 @@ void test_rename_across_dirs(void)
     write_text("/a/f", "x");
 
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_rename(&s_fs, "/a/f", "/b/f"));
-    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, bfs_stat(&s_fs, "/a/f", NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_FOUND, stat_size_type(&s_fs, "/a/f", NULL, NULL));
     uint32_t size = 0;
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/b/f", &size, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/b/f", &size, NULL));
     TEST_ASSERT_EQUAL_UINT32(1, size);
 }
 
@@ -576,7 +612,7 @@ void test_rename_dir_into_itself_fails(void)
 
     // Соседнее имя с тем же началом - не потомок, переименовывать можно.
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_rename(&s_fs, "/a", "/ab"));
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/ab/b", NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/ab/b", NULL, NULL));
 }
 
 // Путь через файл - не NOT_FOUND, а NOT_DIR: иначе содержимое файла
@@ -586,8 +622,107 @@ void test_path_through_file_fails(void)
     mount_fresh();
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/f"));
     write_text("/f", "не каталог");
-    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_DIR, bfs_stat(&s_fs, "/f/x", NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_DIR, stat_size_type(&s_fs, "/f/x", NULL, NULL));
     TEST_ASSERT_EQUAL_INT(BFS_ERR_NOT_DIR, bfs_create(&s_fs, "/f/x"));
+}
+
+// ---------------------------------------------------------------------------
+// Метки времени
+//
+// Часов у ФС нет: значение даёт вызывающий через bfs_set_now. Поэтому здесь
+// проверяется не «часы идут», а что метка доходит до inode и возвращается
+// обратно, и что без времени она остаётся нулевой - иначе `ls -l` показывал
+// бы 1970-й год как настоящую дату.
+// ---------------------------------------------------------------------------
+
+void test_mtime_zero_when_clock_unknown(void)
+{
+    mount_fresh();
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/f"));
+    write_text("/f", "abc");
+
+    bfs_stat_t st;
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/f", &st));
+    TEST_ASSERT_EQUAL_UINT32(0, st.mtime);
+}
+
+void test_mtime_set_on_create_and_write(void)
+{
+    mount_fresh();
+    bfs_set_now(&s_fs, 1794076923u);
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/f"));
+
+    bfs_stat_t st;
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/f", &st));
+    TEST_ASSERT_EQUAL_UINT32(1794076923u, st.mtime);
+
+    // Время идёт: запись обновляет метку, иначе «изменён» значило бы
+    // «создан», и в `ls -l` все файлы выглядели бы одинаково старыми.
+    bfs_set_now(&s_fs, 1794077000u);
+    write_text("/f", "abc");
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/f", &st));
+    TEST_ASSERT_EQUAL_UINT32(1794077000u, st.mtime);
+}
+
+void test_mtime_survives_remount(void)
+{
+    mount_fresh();
+    bfs_set_now(&s_fs, 1794076923u);
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/f"));
+    write_text("/f", "abc");
+
+    bfs_device_t dev = device_for(&s_disk);
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_mount(&s_fs, &dev));
+
+    bfs_stat_t st;
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/f", &st));
+    TEST_ASSERT_EQUAL_UINT32(1794076923u, st.mtime);
+}
+
+// Неизвестное время не должно затирать известное: файл, помеченный в прошлой
+// загрузке, при старте без синхронизации остаётся с прежней меткой.
+void test_mtime_not_erased_by_unknown_clock(void)
+{
+    mount_fresh();
+    bfs_set_now(&s_fs, 1794076923u);
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/f"));
+    write_text("/f", "abc");
+
+    bfs_set_now(&s_fs, 0);
+    write_text("/f", "abcdef");
+
+    bfs_stat_t st;
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/f", &st));
+    TEST_ASSERT_EQUAL_UINT32(1794076923u, st.mtime);
+}
+
+void test_mtime_in_readdir(void)
+{
+    mount_fresh();
+    bfs_set_now(&s_fs, 1794076923u);
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/f"));
+
+    char name[BFS_NAME_MAX + 1];
+    bfs_stat_t st;
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_readdir(&s_fs, "/", 0, name, &st));
+    TEST_ASSERT_EQUAL_STRING("f", name);
+    TEST_ASSERT_EQUAL_UINT32(1794076923u, st.mtime);
+}
+
+void test_truncate_updates_mtime(void)
+{
+    mount_fresh();
+    bfs_set_now(&s_fs, 1794076923u);
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_create(&s_fs, "/f"));
+    write_text("/f", "abcdef");
+
+    bfs_set_now(&s_fs, 1794077000u);
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_truncate(&s_fs, "/f", 3));
+
+    bfs_stat_t st;
+    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/f", &st));
+    TEST_ASSERT_EQUAL_UINT32(3, st.size);
+    TEST_ASSERT_EQUAL_UINT32(1794077000u, st.mtime);
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +742,7 @@ void test_data_survives_remount(void)
     TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_mount(&s_fs, &dev));
 
     uint32_t size = 0;
-    TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&s_fs, "/etc/rc", &size, NULL));
+    TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&s_fs, "/etc/rc", &size, NULL));
     TEST_ASSERT_EQUAL_UINT32(strlen("echo basalt"), size);
     check_pattern("/data", 6000, 17);
 }
@@ -640,7 +775,7 @@ void test_power_cut_leaves_consistent_state(void)
         TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_mount(&fs, &dev));
 
         uint32_t size = 0;
-        TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_stat(&fs, "/f", &size, NULL));
+        TEST_ASSERT_EQUAL_INT(BFS_OK, stat_size_type(&fs, "/f", &size, NULL));
         TEST_ASSERT_TRUE(size == old_len || size == new_len);
 
         static uint8_t buf[3u * BFS_BLOCK_SIZE];
@@ -672,7 +807,7 @@ void test_power_cut_during_create(void)
         TEST_ASSERT_EQUAL_INT(BFS_OK, bfs_mount(&fs, &dev));
 
         uint32_t size = 12345;
-        const int rc = bfs_stat(&fs, "/new", &size, NULL);
+        const int rc = stat_size_type(&fs, "/new", &size, NULL);
         TEST_ASSERT_TRUE(rc == BFS_OK || rc == BFS_ERR_NOT_FOUND);
         if (rc == BFS_OK) {
             TEST_ASSERT_EQUAL_UINT32(0, size);
@@ -738,6 +873,13 @@ int main(void)
     RUN_TEST(test_rename_to_existing_fails);
     RUN_TEST(test_rename_dir_into_itself_fails);
     RUN_TEST(test_path_through_file_fails);
+
+    RUN_TEST(test_mtime_zero_when_clock_unknown);
+    RUN_TEST(test_mtime_set_on_create_and_write);
+    RUN_TEST(test_mtime_survives_remount);
+    RUN_TEST(test_mtime_not_erased_by_unknown_clock);
+    RUN_TEST(test_mtime_in_readdir);
+    RUN_TEST(test_truncate_updates_mtime);
 
     RUN_TEST(test_data_survives_remount);
     RUN_TEST(test_power_cut_leaves_consistent_state);

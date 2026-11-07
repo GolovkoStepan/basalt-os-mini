@@ -442,6 +442,15 @@ int vfs_usage(const char* path, uint32_t* used, uint32_t* total)
     return s_mounts[m].backend.usage(s_mounts[m].backend.ctx, used, total);
 }
 
+void vfs_set_now(uint32_t unix_secs)
+{
+    for (size_t i = 0; i < VFS_MOUNT_MAX; ++i) {
+        if (s_mounts[i].used && s_mounts[i].backend.set_now != NULL) {
+            s_mounts[i].backend.set_now(s_mounts[i].backend.ctx, unix_secs);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Открытые файлы
 // ---------------------------------------------------------------------------

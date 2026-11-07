@@ -82,7 +82,8 @@ enum {
 
 typedef struct {
     uint32_t size;
-    uint16_t type;  // VFS_TYPE_FILE / VFS_TYPE_DIR
+    uint32_t mtime;  // секунды Unix; 0 - неизвестно
+    uint16_t type;   // VFS_TYPE_FILE / VFS_TYPE_DIR
 } vfs_stat_t;
 
 // Операции конкретной ФС. Пути - абсолютные внутри своей точки монтирования
@@ -108,6 +109,10 @@ typedef struct vfs_backend {
                  uint32_t* done);
     int (*truncate)(void* ctx, const char* path, uint32_t size);
     int (*usage)(void* ctx, uint32_t* used, uint32_t* total);
+    // Необязательный: у ФС с метками времени - «который сейчас час». Время
+    // даёт вызывающий, ФС часов не читает (см. bfs_set_now). NULL - у этой
+    // точки монтирования меток нет, и vfs_set_now её просто пропускает.
+    void (*set_now)(void* ctx, uint32_t unix_secs);
 } vfs_backend_t;
 
 // Сбросить таблицу монтирования и текущий каталог в "/". Нужно и при старте,
@@ -157,6 +162,10 @@ int vfs_truncate(const char* path, uint32_t size);
 int vfs_readdir(const char* path, uint32_t index, char* name, vfs_stat_t* out);
 // Занято и всего, в байтах.
 int vfs_usage(const char* path, uint32_t* used, uint32_t* total);
+// Время для новых меток на всех точках монтирования. Секунды Unix, 0 -
+// «часы не установлены». Вызывается, когда время меняется: при старте (когда
+// прочитан /etc/clock) и командой `date set`.
+void vfs_set_now(uint32_t unix_secs);
 
 // Открытые файлы. fd - индекс в таблице; закрывать обязательно, слотов восемь.
 int vfs_open(const char* path, uint8_t flags, int* fd);

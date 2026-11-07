@@ -46,15 +46,15 @@ static uint16_t map_type(uint16_t t)
 
 static int bfs_stat_op(void* ctx, const char* path, vfs_stat_t* out)
 {
-    uint32_t size = 0;
-    uint16_t type = 0;
-    const int rc = bfs_stat((bfs_t*)ctx, path, &size, &type);
+    bfs_stat_t st;
+    const int rc = bfs_stat((bfs_t*)ctx, path, &st);
     if (rc != BFS_OK) {
         return map_error(rc);
     }
     if (out != NULL) {
-        out->size = size;
-        out->type = map_type(type);
+        out->size = st.size;
+        out->mtime = st.mtime;
+        out->type = map_type(st.type);
     }
     return VFS_OK;
 }
@@ -87,15 +87,15 @@ static int bfs_rename_op(void* ctx, const char* from, const char* to)
 static int bfs_readdir_op(void* ctx, const char* path, uint32_t index, char* name,
                           vfs_stat_t* out)
 {
-    uint16_t type = 0;
-    uint32_t size = 0;
-    const int rc = bfs_readdir((bfs_t*)ctx, path, index, name, &type, &size);
+    bfs_stat_t st;
+    const int rc = bfs_readdir((bfs_t*)ctx, path, index, name, &st);
     if (rc != BFS_OK) {
         return map_error(rc);
     }
     if (out != NULL) {
-        out->type = map_type(type);
-        out->size = size;
+        out->type = map_type(st.type);
+        out->size = st.size;
+        out->mtime = st.mtime;
     }
     return VFS_OK;
 }
@@ -136,6 +136,13 @@ static int bfs_usage_op(void* ctx, uint32_t* used, uint32_t* total)
     return VFS_OK;
 }
 
+// Время даёт вызывающий: bfs_set_now - единственный вход, и адаптер здесь
+// ничего не решает, а только передаёт.
+static void bfs_set_now_op(void* ctx, uint32_t unix_secs)
+{
+    bfs_set_now((bfs_t*)ctx, unix_secs);
+}
+
 vfs_backend_t vfs_bfs_backend(bfs_t* fs)
 {
     vfs_backend_t be;
@@ -152,5 +159,6 @@ vfs_backend_t vfs_bfs_backend(bfs_t* fs)
     be.write = bfs_write_op;
     be.truncate = bfs_truncate_op;
     be.usage = bfs_usage_op;
+    be.set_now = bfs_set_now_op;
     return be;
 }

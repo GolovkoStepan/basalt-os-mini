@@ -206,7 +206,11 @@ static bool write_files(void)
         const char rc_text[] = "echo привет\n";
         rc = bfs_create(&s_fs, "/etc/rc");
         if (rc == BFS_ERR_EXISTS) {
-            rc = BFS_OK;
+            // Файл мог остаться от шелла (`/etc/rc` пишет rc при первом
+            // старте), и он там длиннее. Запись с нуля без усечения оставила
+            // бы хвост старого содержимого, и сверка размера потом ругалась
+            // бы не на ошибку ФС, а на этот хвост.
+            rc = bfs_truncate(&s_fs, "/etc/rc", 0);
         }
         uint32_t done = 0;
         if (rc == BFS_OK) {
@@ -308,21 +312,30 @@ static bool verify_after_remount(void)
 
     bool ok = true;
 
-    uint32_t size = 0;
-    uint16_t type = 0;
-    int err = bfs_stat(&s_fs, "/etc/rc", &size, &type);
+    bfs_stat_t st;
+    int err = bfs_stat(&s_fs, "/etc/rc", &st);
     basalt_put("[fs] /etc/rc: размер ");
     if (err != BFS_OK) {
         put_err(err);
         ok = false;
     } else {
-        basalt_put_u64(size);
+        basalt_put_u64(st.size);
         basalt_put(" Б, тип ");
-        basalt_put_u64(type == BFS_TYPE_DIR ? 1u : 0u);
-        basalt_put(type == BFS_TYPE_DIR ? " (каталог)" : " (файл)");
-        if (type != BFS_TYPE_FILE || size != sizeof("echo привет\n") - 1u) {
+        basalt_put_u64(st.type == BFS_TYPE_DIR ? 1u : 0u);
+        basalt_put(st.type == BFS_TYPE_DIR ? " (каталог)" : " (файл)");
+        if (st.type != BFS_TYPE_FILE || st.size != sizeof("echo привет\n") - 1u) {
             basalt_put(" - не то, что писали");
             ok = false;
+        }
+        // Время проверяется здесь же: щуп пишет файл с известной меткой, и
+        // после перемонтирования она должна читаться с диска, а не из памяти.
+        // Ноль означал бы, что mtime не попал в inode.
+        basalt_put(", метка ");
+        if (st.mtime == 0) {
+            basalt_put("не записалась");
+            ok = false;
+        } else {
+            basalt_put_u64(st.mtime);
         }
     }
     basalt_put("\n");
@@ -369,9 +382,8 @@ static bool verify_after_remount(void)
     char name[BFS_NAME_MAX + 1];
     bool saw_etc = false;
     for (uint32_t i = 0;; ++i) {
-        uint16_t child_type = 0;
-        uint32_t child_size = 0;
-        err = bfs_readdir(&s_fs, "/", i, name, &child_type, &child_size);
+        bfs_stat_t child;
+        err = bfs_readdir(&s_fs, "/", i, name, &child);
         if (err == BFS_ERR_NOT_FOUND) {
             break;
         }
@@ -386,11 +398,11 @@ static bool verify_after_remount(void)
         }
         basalt_put(" ");
         basalt_put(name);
-        if (child_type == BFS_TYPE_DIR) {
+        if (child.type == BFS_TYPE_DIR) {
             basalt_put("/");
         } else {
             basalt_put("(");
-            basalt_put_u64(child_size);
+            basalt_put_u64(child.size);
             basalt_put(")");
         }
     }
@@ -465,6 +477,11 @@ void basalt_main(void)
             // проверки на одно условие однажды разойдутся, и щуп начнёт
             // пропускать то, на чём система откажется работать.
             if (mount_or_format(size) == 0) {
+                // Метка времени в щупе ставится фиксированная: 2026-11-07
+                // 18:42:03. Настоящих часов у щупа нет, а проверяется не
+                // «который час», а то, что значение доходит до inode, ложится
+                // на диск и читается после перемонтирования.
+                bfs_set_now(&s_fs, 1794076923u);
                 ok = write_files();
                 ok = verify_after_remount() && ok;
             }

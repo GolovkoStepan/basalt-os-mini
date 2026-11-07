@@ -23,7 +23,10 @@
 #include "bfs.h"
 #include "bfs_flash.h"
 #include "button.h"
+#include "calendar.h"
+#include "clock.h"
 #include "console_usb_jtag.h"
+#include "duration.h"
 #include "editor.h"
 #include "esp_heap_caps.h"
 #include "format.h"
@@ -63,6 +66,11 @@ static bool s_mirror = true;
 // Ввод закрыт по Ctrl-D: читать порт продолжаем (иначе не видно, жива ли
 // плата), но в редактор байты не отдаём.
 static bool s_halt;
+
+// Часы нужны и командам выше по файлу (reboot сохраняет время перед сбросом),
+// поэтому объявления стоят здесь, а определения - ниже, в блоке времени.
+static bool shell_now(uint32_t* out);
+static int fs_save_clock(uint32_t unix_secs);
 
 // --- вывод: экран и USB ---------------------------------------------------
 
@@ -477,30 +485,6 @@ static void cmd_history(int argc, char** argv)
     }
 }
 
-// Дата и время. Часов реального времени у платы нет: нет ни RTC-микросхемы,
-// ни NTP. Поэтому показываем то, что действительно известно - сколько прошло
-// с запуска. Врать календарной датой из ниоткуда было бы хуже, чем её не иметь.
-static void cmd_date(int argc, char** argv)
-{
-    (void)argc;
-    (void)argv;
-
-    const uint64_t total = basalt_uptime_us() / 1000000u;
-    const uint64_t days = total / 86400u;
-    const uint64_t rest = total % 86400u;
-
-    out_puts("date: ");
-    out_u64(days);
-    out_puts(" д ");
-    out_u64_2(rest / 3600u);
-    out_puts(":");
-    out_u64_2((rest % 3600u) / 60u);
-    out_puts(":");
-    out_u64_2(rest % 60u);
-    out_puts(" с запуска\n");
-    out_puts("календаря нет: RTC на плате нет, NTP появится вместе с Wi-Fi\n");
-}
-
 // Проценты печатает format.c: формула живёт в одном месте, иначе «12%» в `top`
 // и «11%» в `free` про одно и то же число.
 static void out_percent(size_t part, size_t total)
@@ -626,6 +610,101 @@ static void cmd_beep(int argc, char** argv)
     out_puts("на плате нет пищалки: BEL отправлен в терминал\n");
 }
 
+// Подождать. Ждём опросом: планировщика в системе нет, усыпить ядро нечем.
+// Поэтому `sleep 5` - это пять секунд, в течение которых прерывание Ctrl-C не
+// придёт: консоль читается только в главном цикле, а он стоит здесь. Так честнее
+// и понятнее, чем изображать прерываемый сон через кнопку, которую никто не
+// нажмёт.
+static void cmd_sleep(int argc, char** argv)
+{
+    if (argc < 2) {
+        out_diag("sleep <длительность>: 5, 300ms, 1m30s\n");
+        return;
+    }
+
+    uint32_t ms = 0;
+    if (!duration_parse(argv[1], &ms)) {
+        out_diag("sleep: негодная длительность (до 24 ч): ");
+        out_diag(argv[1]);
+        out_diag("\n");
+        return;
+    }
+
+    // Зеркало получает сообщение до сна: иначе в терминале мака между командой
+    // и результатом висела бы пустота, и казалось бы, что плата зависла.
+    present_dirty();
+    char text[32];
+    out_puts("сплю ");
+    out_puts(duration_text(text, sizeof(text), ms));
+    out_puts("\n");
+    present_dirty();
+
+    const uint64_t until = basalt_uptime_us() + (uint64_t)ms * 1000u;
+    while (basalt_uptime_us() < until) {
+    }
+
+    out_puts("проснулся\n");
+}
+
+// Будильник: мигание подсветкой через заданный интервал. Звука на плате нет -
+// пищалки не распаяно, поэтому сигнал визуальный. Подсветка, а не текст на
+// экране: мигание видно с другого конца стола, и оно не затирает то, что уже
+// написано.
+static void cmd_alarm(int argc, char** argv)
+{
+    if (argc < 2) {
+        out_diag("alarm <через сколько>: 10s, 1m\n");
+        return;
+    }
+
+    uint32_t ms = 0;
+    if (!duration_parse(argv[1], &ms)) {
+        out_diag("alarm: негодная длительность (до 24 ч): ");
+        out_diag(argv[1]);
+        out_diag("\n");
+        return;
+    }
+
+    present_dirty();
+    char text[32];
+    out_puts("будильник через ");
+    out_puts(duration_text(text, sizeof(text), ms));
+    out_puts(", Ctrl-C для отмены\n");
+
+    const uint64_t until = basalt_uptime_us() + (uint64_t)ms * 1000u;
+
+    // Ожидание с проверкой кнопки и консоли: будильник, который нельзя
+    // отменить, ставит систему в известное состояние на минуту вперёд, и это
+    // раздражает сильнее, чем помогает.
+    while (basalt_uptime_us() < until) {
+        if (button_down(BUTTON_PRIMARY)) {
+            basalt_delay_us(30000);
+            if (button_down(BUTTON_PRIMARY)) {
+                out_puts("будильник отменён\n");
+                return;
+            }
+        }
+
+        uint8_t b = 0;
+        if (basalt_console_read(&b, 1) > 0 && b == 0x03) {
+            out_puts("^C будильник отменён\n");
+            return;
+        }
+        basalt_delay_us(2000);
+    }
+
+    // Пять секунд мигания: короткое мигание можно пропустить, если в этот
+    // момент смотришь не на плату.
+    for (int i = 0; i < 10; ++i) {
+        lcd_backlight((i % 2) == 0);
+        basalt_delay_us(500000);
+    }
+    lcd_backlight(true);
+
+    mirror_str("\a");
+    out_puts("будильник!\n");
+}
+
 static void cmd_clear(int argc, char** argv)
 {
     (void)argc;
@@ -673,6 +752,15 @@ static void cmd_reboot(int argc, char** argv)
     (void)argv;
 
     out_puts("перезагрузка\n");
+
+    // Время перед сбросом сохраняется: после загрузки часы поднимутся из
+    // /etc/clock, и «время выключения» станет моментом перезагрузки, а не
+    // моментом, когда время установили последний раз. Без этого `date`
+    // после перезагрузки отставал бы на всю сессию.
+    uint32_t now = 0;
+    if (shell_now(&now)) {
+        (void)fs_save_clock(now);
+    }
 
     // Дать выводу дойти до экрана и до USB. Сброс сразу после печати оставил бы
     // недорисованную строку - а по ней как раз и проверяют, что команда дошла.
@@ -939,9 +1027,203 @@ static void out_path_error(int rc)
     out_diag("\n");
 }
 
+static size_t str_app(char* out, size_t cap, size_t at, const char* s);
+
+// Дата и время. Часов реального времени у платы нет: нет ни RTC-микросхемы с
+// батарейкой, ни NTP. Но время всё равно нужно - хотя бы для меток файлов,
+// иначе `ls -l` бессмыслен. Поэтому время в системе устроено так:
+//
+//   - при старте оно не установлено, и `date` говорит об этом прямо, а не
+//     показывает 1970-й;
+//   - установить его можно командой `date set`, и оно сохраняется в
+//     /etc/clock;
+//   - при следующем старте время берётся из /etc/clock и идёт от момента,
+//     когда его записали. Плата была выключена - значит отстаёт ровно на это
+//     время, и это единственное, что можно сделать без RTC.
+//
+// Отдельного файла настроек нет: /etc/clock - обычный файл в корне ФС, и
+// его можно посмотреть, перезаписать и удалить теми же командами, что и всё
+// остальное.
+#define CLOCK_PATH "/etc/clock"
+
+static clock_t s_clock;
+
+// Прочитать сохранённое время и поставить часы. Файла нет - не ошибка:
+// первый запуск после разметки ничем не отличается от второго, просто время
+// останется неустановленным.
+static void fs_load_clock(void)
+{
+    if (!s_fs_ready) {
+        return;
+    }
+
+    clock_reset(&s_clock);
+
+    int fd = -1;
+    if (vfs_open(CLOCK_PATH, VFS_O_RDONLY, &fd) != VFS_OK) {
+        return;
+    }
+
+    char text[64];
+    uint32_t got = 0;
+    const int rc = vfs_read(fd, text, sizeof(text) - 1, &got);
+    vfs_close(fd);
+    if (rc != VFS_OK || got == 0) {
+        return;
+    }
+    text[got] = '\0';
+
+    uint32_t unix_secs = 0;
+    if (!cal_parse(text, &unix_secs)) {
+        // Файл испорчен - это не повод не работать. Метка неизвестна, и
+        // `date` так и скажет; молча подставлять «сейчас» значило бы соврать.
+        basalt_put("[shell] /etc/clock не разобран, время не установлено\n");
+        return;
+    }
+
+    clock_set(&s_clock, unix_secs, basalt_uptime_us());
+    vfs_set_now(unix_secs);
+
+    basalt_put("[shell] время из /etc/clock, часы идут с запуска\n");
+}
+
+// Записать текущее время в /etc/clock. Вызывается после `date set` и перед
+// перезагрузкой: в первом случае - чтобы время пережило выключение, во
+// втором - чтобы «время последнего включения» было честным, а не моментом
+// первой установки.
+static int fs_save_clock(uint32_t unix_secs)
+{
+    if (!s_fs_ready) {
+        return VFS_ERR_NO_MOUNT;
+    }
+
+    char text[CAL_TEXT_MAX];
+    cal_text(text, sizeof(text), unix_secs);
+    const size_t len = strlen(text);
+
+    int fd = -1;
+    int rc = vfs_open(CLOCK_PATH, VFS_O_WRONLY | VFS_O_CREATE | VFS_O_TRUNC, &fd);
+    if (rc != VFS_OK) {
+        return rc;
+    }
+    uint32_t put = 0;
+    rc = vfs_write(fd, text, (uint32_t)len, &put);
+    vfs_close(fd);
+    if (rc == VFS_OK && put != len) {
+        return VFS_ERR_IO;
+    }
+    return rc;
+}
+
+// Где взять «сейчас». Часы не читаются модулем напрямую, поэтому показание
+// счётчика передаётся сюда.
+static bool shell_now(uint32_t* out)
+{
+    return clock_now(&s_clock, basalt_uptime_us(), out);
+}
+
+static void cmd_date(int argc, char** argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "set") == 0) {
+        // Две формы: `date set 2026-11-07 18:42:03` (дата и время
+        // отдельными словами, так удобнее набирать) и одной строкой.
+        char text[CAL_TEXT_MAX + 8];
+        if (argc == 4) {
+            // Склеиваем вручную: snprintf тянет newlib ради одной операции, а
+            // str_app уже есть и обрезает по размеру. Возврат каждого вызова
+            // надо использовать: str_app сам ставит ноль за последним
+            // символом, поэтому прибавка к позиции оставила бы этот ноль
+            // посреди строки и разбор увидел бы одну дату без времени.
+            size_t at = str_app(text, sizeof(text), 0, argv[2]);
+            at = str_app(text, sizeof(text), at, " ");
+            str_app(text, sizeof(text), at, argv[3]);
+        } else if (argc == 3) {
+            str_app(text, sizeof(text), 0, argv[2]);
+        } else {
+            out_diag("date set ГГГГ-ММ-ДД ЧЧ:ММ[:СС]\n");
+            return;
+        }
+
+        uint32_t unix_secs = 0;
+        if (!cal_parse(text, &unix_secs)) {
+            out_diag("date set: негодная дата, нужно ГГГГ-ММ-ДД ЧЧ:ММ[:СС]\n");
+            return;
+        }
+
+        clock_set(&s_clock, unix_secs, basalt_uptime_us());
+        vfs_set_now(unix_secs);
+
+        // Часы идут и без файла, но тогда время потеряется при сбросе.
+        // Сообщаем об этом, а не делаем вид, что всё сохранено.
+        const int rc = fs_save_clock(unix_secs);
+        if (rc != VFS_OK) {
+            out_diag("date set: время установлено, но ");
+            out_diag(CLOCK_PATH);
+            out_diag(" не записан: ");
+            out_diag(vfs_strerror(rc));
+            out_diag("\n");
+            return;
+        }
+
+        char buf[CAL_TEXT_MAX];
+        out_puts("время: ");
+        out_puts(cal_text(buf, sizeof(buf), unix_secs));
+        out_puts(", сохранено в ");
+        out_puts(CLOCK_PATH);
+        out_puts("\n");
+        return;
+    }
+
+    uint32_t now = 0;
+    const bool synced = shell_now(&now);
+
+    const uint64_t total = basalt_uptime_us() / 1000000u;
+    const uint64_t days = total / 86400u;
+    const uint64_t rest = total % 86400u;
+
+    if (synced) {
+        char buf[CAL_TEXT_MAX];
+        out_puts(cal_text(buf, sizeof(buf), now));
+        out_puts(" ");
+        out_puts(cal_weekday_short(cal_weekday(now)));
+
+        // Сказать, откуда время, - не украшение: если часы подняты из
+        // /etc/clock и идут с запуска, дата отстаёт на время выключения, и
+        // знать это важно.
+        const uint32_t age = clock_age_secs(&s_clock, basalt_uptime_us());
+        out_puts(" (с запуска ");
+        out_u64(age);
+        out_puts(" с)\n");
+    } else {
+        out_puts("календарь не установлен: date set ГГГГ-ММ-ДД ЧЧ:ММ\n");
+    }
+
+    out_puts("uptime: ");
+    out_u64(days);
+    out_puts(" д ");
+    out_u64_2(rest / 3600u);
+    out_puts(":");
+    out_u64_2((rest % 3600u) / 60u);
+    out_puts(":");
+    out_u64_2(rest % 60u);
+    out_puts("\n");
+}
+
+
 static void cmd_ls(int argc, char** argv)
 {
-    const char* const path = (argc > 1) ? argv[1] : ".";
+    // -l - подробный вид: дата, размер, имя. Флаг отдельным словом, как в
+    // обычном ls; сочетания вроде -la не поддерживаются, пока других флагов
+    // нет: один флаг не стоит разбора строки.
+    bool long_view = false;
+    const char* path = ".";
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-l") == 0) {
+            long_view = true;
+        } else {
+            path = argv[i];
+        }
+    }
 
     char name[VFS_NAME_MAX + 1];
     uint32_t count = 0;
@@ -957,12 +1239,39 @@ static void cmd_ls(int argc, char** argv)
             return;
         }
 
+        if (long_view) {
+            // Дата фиксированной ширины: колонка должна читаться сверху
+            // вниз. Нет времени - прочерк, а не 1970-й: «время неизвестно»
+            // и «создан в прошлом веке» - разные вещи.
+            if (st.mtime != 0) {
+                char when[CAL_TEXT_MAX];
+                out_puts(cal_text_short(when, sizeof(when), st.mtime));
+            } else {
+                // Столько же знаков, сколько у настоящей даты («07.11 18:42»):
+                // иначе колонка разъезжается там, где время неизвестно.
+                out_puts("--.-- --:--");
+            }
+            out_puts("  ");
+
+            // Размер в колонку из шести знаков: без выравнивания числа
+            // разной длины сдвигают имена, и список перестаёт читаться.
+            char num[21];
+            const char* const s = basalt_format_u64(num, sizeof(num), st.size);
+            for (size_t pad = strlen(s); pad < 6; ++pad) {
+                out_puts(" ");
+            }
+            out_puts(s);
+            out_puts("  ");
+        }
+
         out_puts(name);
         if (st.type == VFS_TYPE_DIR) {
             out_puts("/\n");
         } else {
-            out_puts("  ");
-            out_bytes(st.size);
+            if (!long_view) {
+                out_puts("  ");
+                out_bytes(st.size);
+            }
             out_puts("\n");
         }
         ++count;
@@ -1125,6 +1434,13 @@ static void cmd_stat(int argc, char** argv)
 
     out_puts(st.type == VFS_TYPE_DIR ? "каталог, " : "файл, ");
     out_bytes(st.size);
+    if (st.mtime != 0) {
+        char when[CAL_TEXT_MAX];
+        out_puts(", изменён ");
+        out_puts(cal_text(when, sizeof(when), st.mtime));
+    } else {
+        out_puts(", время изменения неизвестно");
+    }
     out_puts("\n");
 }
 
@@ -2346,7 +2662,9 @@ static const command s_commands[] = {
     {"help",    cmd_help,    "этот список"},
     {"echo",    cmd_echo,    "напечатать аргументы"},
     {"history", cmd_history, "последние команды"},
-    {"date",    cmd_date,    "время с запуска"},
+    {"date",    cmd_date,    "время; date set ГГГГ-ММ-ДД ЧЧ:ММ"},
+    {"sleep",   cmd_sleep,   "подождать: 5, 300ms, 1m30s"},
+    {"alarm",   cmd_alarm,   "будильник: мигание подсветкой"},
     {"free",    cmd_free,    "память и стек"},
     {"top",     cmd_top,     "задачи и остаток стека"},
     {"beep",    cmd_beep,    "писк в терминал"},
@@ -2355,7 +2673,7 @@ static const command s_commands[] = {
     {"mirror",  cmd_mirror,  "on|off: повторять поток в USB"},
     {"reboot",  cmd_reboot,  "перезагрузка"},
     {"crash",   cmd_crash,   "проверить панику"},
-    {"ls",      cmd_ls,      "каталог: имена и размеры"},
+    {"ls",      cmd_ls,      "каталог: ls -l — даты и размеры"},
     {"cat",     cmd_cat,     "показать файл"},
     {"hexdump", cmd_hexdump, "файл байтами: смещение, hex, ASCII"},
     {"less",    cmd_less,    "постранично: пробел, b, q"},
@@ -2751,6 +3069,9 @@ void basalt_main(void)
     fs_mount_root();
     fs_ensure_rc();
 
+    // Часы - до /etc/rc: если в стартовом файле есть `ls -l` или `date`, они
+    // должны видеть уже установленное время, а не прочерк.
+    fs_load_clock();
     out_puts("basalt-os mini\n");
     out_puts("\n");
     out_puts("help - список команд\n");

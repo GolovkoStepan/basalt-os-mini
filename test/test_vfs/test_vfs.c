@@ -571,6 +571,33 @@ void test_rename_through_dotdot(void)
     TEST_ASSERT_EQUAL_INT(VFS_OK, vfs_stat("/d/f2", NULL));
 }
 
+// Время идёт снаружи, а не из ФС: vfs_set_now обходит точки монтирования и
+// передаёт значение в бэкенд. Проверяем, что оно доходит до inode и видно в
+// stat и readdir - именно по этим двум путям `ls -l` и берёт дату.
+void test_time_propagates_to_stat_and_readdir(void)
+{
+    mount_fresh();
+    vfs_set_now(1794076923u);
+
+    int fd = -1;
+    TEST_ASSERT_EQUAL_INT(VFS_OK, vfs_open("/f", VFS_O_CREATE, &fd));
+    TEST_ASSERT_EQUAL_INT(VFS_OK, vfs_close(fd));
+
+    vfs_stat_t st;
+    TEST_ASSERT_EQUAL_INT(VFS_OK, vfs_stat("/f", &st));
+    TEST_ASSERT_EQUAL_UINT32(1794076923u, st.mtime);
+
+    char name[VFS_NAME_MAX + 1];
+    TEST_ASSERT_EQUAL_INT(VFS_OK, vfs_readdir("/", 0, name, &st));
+    TEST_ASSERT_EQUAL_STRING("f", name);
+    TEST_ASSERT_EQUAL_UINT32(1794076923u, st.mtime);
+
+    // Сброс в «время неизвестно» не должен стирать уже записанную метку.
+    vfs_set_now(0);
+    TEST_ASSERT_EQUAL_INT(VFS_OK, vfs_stat("/f", &st));
+    TEST_ASSERT_EQUAL_UINT32(1794076923u, st.mtime);
+}
+
 void test_usage(void)
 {
     mount_fresh();
@@ -629,6 +656,7 @@ int main(void)
     RUN_TEST(test_readdir_walks_entries);
     RUN_TEST(test_rename_and_remove);
     RUN_TEST(test_rename_through_dotdot);
+    RUN_TEST(test_time_propagates_to_stat_and_readdir);
     RUN_TEST(test_usage);
 
     RUN_TEST(test_strerror_is_never_empty);

@@ -31,7 +31,7 @@ typedef struct {
 typedef struct {
     uint32_t mode;  // 0 - узел свободен; иначе BFS_TYPE_FILE / BFS_TYPE_DIR
     uint32_t size;  // байт
-    uint32_t mtime; // пока не заполняется: часов в системе нет
+    uint32_t mtime; // секунды Unix; 0 - время неизвестно (bfs_set_now)
     uint32_t links;
     uint32_t direct[BFS_DIRECT_BLOCKS];
     uint32_t indirect;
@@ -606,6 +606,14 @@ static int file_write(bfs_t* fs, bfs_inode_disk_t* ino, uint32_t offset, const v
     if (offset + total > ino->size) {
         ino->size = offset + total;
     }
+    // Метка ставится и файлу, и каталогу: в каталог содержимое пишется теми же
+    // dir_add/dir_remove, и «когда менялся этот каталог» - такой же вопрос,
+    // как про файл. При неустановленных часах (now == 0) метка не трогается:
+    // затирать известное время нулём значило бы терять данные при каждом
+    // старте без синхронизации.
+    if (total != 0 && fs->now != 0) {
+        ino->mtime = fs->now;
+    }
     if (done != NULL) {
         *done = total;
     }
@@ -724,6 +732,9 @@ static int file_truncate(bfs_t* fs, bfs_inode_disk_t* ino, uint32_t size)
     }
 
     ino->size = size;
+    if (fs->now != 0) {
+        ino->mtime = fs->now;
+    }
     fs->dirty = true;
     return BFS_OK;
 }
@@ -1280,7 +1291,18 @@ int bfs_mount(bfs_t* fs, const bfs_device_t* dev)
     return BFS_OK;
 }
 
-int bfs_stat(bfs_t* fs, const char* path, uint32_t* size, uint16_t* type)
+// Время для новых меток. Значение приходит снаружи: у ФС нет своих часов, и
+// заводить их здесь значило бы, что формат зависит от платы. Ноль означает
+// «часы не установлены» - тогда метки не пишутся, и `ls -l` честно показывает
+// прочерк вместо 1970-го года.
+void bfs_set_now(bfs_t* fs, uint32_t unix_secs)
+{
+    if (fs != NULL) {
+        fs->now = unix_secs;
+    }
+}
+
+int bfs_stat(bfs_t* fs, const char* path, bfs_stat_t* out)
 {
     int rc = fs_ready(fs);
     if (rc != BFS_OK) {
@@ -1291,11 +1313,10 @@ int bfs_stat(bfs_t* fs, const char* path, uint32_t* size, uint16_t* type)
     if (rc != BFS_OK) {
         return rc;
     }
-    if (size != NULL) {
-        *size = ino.size;
-    }
-    if (type != NULL) {
-        *type = (uint16_t)(ino.mode & BFS_TYPE_MASK);
+    if (out != NULL) {
+        out->size = ino.size;
+        out->mtime = ino.mtime;
+        out->type = (uint16_t)(ino.mode & BFS_TYPE_MASK);
     }
     return BFS_OK;
 }
@@ -1333,6 +1354,7 @@ int bfs_create(bfs_t* fs, const char* path)
     memset(&ino, 0, sizeof(ino));
     ino.mode = BFS_TYPE_FILE;
     ino.links = 1;
+    ino.mtime = fs->now;
     rc = inode_store(fs, index, &ino);
     if (rc != BFS_OK) {
         return rc;
@@ -1387,6 +1409,7 @@ int bfs_mkdir(bfs_t* fs, const char* path)
     memset(&ino, 0, sizeof(ino));
     ino.mode = BFS_TYPE_DIR;
     ino.links = 2;
+    ino.mtime = fs->now;
     rc = inode_store(fs, index, &ino);
     if (rc != BFS_OK) {
         return rc;
@@ -1641,8 +1664,7 @@ int bfs_write(bfs_t* fs, const char* path, uint32_t offset, const void* src, uin
     return fs_commit(fs);
 }
 
-int bfs_readdir(bfs_t* fs, const char* path, uint32_t index, char* name, uint16_t* type,
-                uint32_t* size)
+int bfs_readdir(bfs_t* fs, const char* path, uint32_t index, char* name, bfs_stat_t* out)
 {
     int rc = fs_ready(fs);
     if (rc != BFS_OK) {
@@ -1684,16 +1706,19 @@ int bfs_readdir(bfs_t* fs, const char* path, uint32_t index, char* name, uint16_
                 memcpy(name, e->name, e->name_len);
                 name[e->name_len] = '\0';
             }
-            if (type != NULL) {
-                *type = e->type;
-            }
-            if (size != NULL) {
+            if (out != NULL) {
+                // Размер и время лежат не в записи каталога, а в inode: запись
+                // - 32 байта, и хранить там ещё и метку значило бы увеличить
+                // её (и весь блок на 128 записей) ради того, что и так
+                // читается одним переходом.
                 bfs_inode_disk_t child;
                 rc = inode_load(fs, e->inode, &child);
                 if (rc != BFS_OK) {
                     return rc;
                 }
-                *size = child.size;
+                out->type = e->type;
+                out->size = child.size;
+                out->mtime = child.mtime;
             }
             return BFS_OK;
         }

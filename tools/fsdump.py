@@ -9,6 +9,10 @@
     ./tools/fsdump.py -o rc.txt /etc/rc    # выгрузить файл на мак
     ./tools/fsdump.py --super              # суперблок, inode и сверка блоков
 
+Дерево печатается с меткой времени файла в том же виде, что `ls -l` на
+плате (`07.11 18:42`), а `--super` добавляет счётчик inode с меткой: ноль в
+поле mtime означает «время неизвестно» и печатается прочерком, а не 1970-м.
+
 Зачем это нужно. ФС — своя (storage/bfs.c), и её формат лежит на диске байтами,
 а не за чужим API. Значит, содержимое можно прочитать и тогда, когда прошивка
 не работает: паника, зависший USB, плата не стартует. В этом случае остаётся
@@ -30,6 +34,7 @@ esptool над загрузчиком — он читает flash, не испо
 """
 
 import argparse
+import datetime
 import os
 import struct
 import subprocess
@@ -191,6 +196,7 @@ class Fs:
             "index": index,
             "mode": fields[0],
             "size": fields[1],
+            "mtime": fields[2],
             "links": fields[3],
             "direct": list(fields[4:4 + DIRECT_BLOCKS]),
             "indirect": fields[4 + DIRECT_BLOCKS],
@@ -328,7 +334,8 @@ def walk(fs, ino, path, items, seen, problems):
             continue
         seen.add(entry["inode"])
         items.append({"path": child_path, "kind": kind,
-                      "size": child["size"], "inode": entry["inode"]})
+                      "size": child["size"], "mtime": child["mtime"],
+                      "inode": entry["inode"]})
         if kind == "каталог":
             walk(fs, child, child_path, items, seen, problems)
 
@@ -345,6 +352,19 @@ def collect(fs):
 # ---------------------------------------------------------------------------
 # Вывод
 # ---------------------------------------------------------------------------
+
+# Метка времени в BFS — секунды Unix, 0 значит «время неизвестно». Формат тот
+# же, что у `ls -l` на плате, включая прочерк: иначе разбирающий дамп и
+# смотрящий на экран видели бы одно и то же поле в двух разных видах и спорили
+# бы, где ошибка.
+def time_text(seconds):
+    if seconds == 0:
+        return "--.-- --:--"
+    try:
+        moment = datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return f"?{seconds}"
+    return moment.strftime("%d.%m %H:%M")
 
 def kib(value):
     if value < 1024:
@@ -369,9 +389,9 @@ def print_tree(items, root_path):
         name = relative.rsplit("/", 1)[-1]
         indent = "  " * relative.count("/")
         if item["kind"] == "каталог":
-            print(f"{indent}{name}/")
+            print(f"{time_text(item['mtime'])}  {indent}{name}/")
         else:
-            print(f"{indent}{name}  {item['size']} Б")
+            print(f"{time_text(item['mtime'])}  {indent}{name}  {item['size']} Б")
 
     files = sum(1 for i in subset if i["kind"] == "файл")
     dirs = sum(1 for i in subset if i["kind"] == "каталог")
@@ -418,6 +438,13 @@ def show_super(fs, seen, problems):
     print(f"\ninode занято {live} из {INODE_COUNT}")
     print(f"блоков занято {len(used)} из {sup['block_count']} "
           f"({len(used) * BLOCK / 1024:.1f} КБ)")
+
+    # Метки времени: сколько файлов их имеет. Ноль в этом поле — не ошибка
+    # (старый образ или запись без установленных часов), но знать, сколько
+    # таких, полезно: иначе «у половины файлов прочерк» выясняется по одному.
+    stamped = sum(1 for i in range(INODE_COUNT)
+                  if fs.inode(i)["mode"] != 0 and fs.inode(i)["mtime"] != 0)
+    print(f"inode с меткой времени: {stamped} из {live}")
 
     for index, block in doubled[:10]:
         problems.append(f"блок {block} занят дважды (inode {index})")

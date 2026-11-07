@@ -45,6 +45,8 @@ set(BASALT_SHELL_INC "")
 set(BASALT_FLASH_SRC "")
 set(BASALT_STORAGE_SRC "")
 set(BASALT_STORAGE_INC "")
+set(BASALT_TIME_SRC "")
+set(BASALT_TIME_INC "")
 
 if(BASALT_APP_PROBE)
     set(BASALT_APP_SRC "probe/main.c")
@@ -108,6 +110,16 @@ elseif(BASALT_APP_SHELL)
         "../storage/vfs_bfs.c"
     )
     set(BASALT_STORAGE_INC "../storage")
+    # Время часами не является железом: календарь и разбор длительностей
+    # переносимые (проверяются на маке), а показание счётчика им передаёт
+    # вызывающий. Поэтому каталог подключается к тому env, где время нужно -
+    # оболочке.
+    set(BASALT_TIME_SRC
+        "../time/calendar.c"
+        "../time/clock.c"
+        "../time/duration.c"
+    )
+    set(BASALT_TIME_INC "../time")
 elseif(BASALT_APP_FLASH)
     # Щуп встроенного flash: тот же старт и та же консоль, но свой main.c и
     # драйвер flash. Драйвер подключается точечно - здесь и в ветках, где без
@@ -156,6 +168,7 @@ idf_component_register(
         ${BASALT_SHELL_SRC}
         ${BASALT_FLASH_SRC}
         ${BASALT_STORAGE_SRC}
+        ${BASALT_TIME_SRC}
     INCLUDE_DIRS
         "../arch/xtensa/include"
         "../drivers"
@@ -164,4 +177,5 @@ idf_component_register(
         ${BASALT_TTY_INC}
         ${BASALT_SHELL_INC}
         ${BASALT_STORAGE_INC}
+        ${BASALT_TIME_INC}
 )
