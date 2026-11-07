@@ -138,7 +138,7 @@ make verify          # то же, что CI: тесты, все env, прове�
 
 - точка входа и линкер-скрипт, таблица векторов, `arch/xtensa`;
 - консоль USB Serial/JTAG по регистрам, тик на SYSTIMER, своя паника;
-- tty с ANSI, шелл, редактор;
+- tty с ANSI, шелл, редактирование строки и полноэкранный редактор `edit`;
 - файловая система во flash (A9): драйвер flash, таблица разделов, ФС `BFS`
   с копированием при записи, VFS и команды над файлами;
 - планировщик и переключение контекста на Xtensa.
@@ -180,7 +180,7 @@ basalt-os-mini/
 ├── boards/cardputer/        board_pins.h Cardputer (уезжает в capsh)
 ├── docs/
 ├── tty/                     line discipline: канон и raw, эхо, Backspace, Ctrl-C/D
-├── shell/                   шелл: история, редактор, разбор, план выполнения, XMODEM
+├── shell/                   шелл: редактор строки, история, разбор, план, XMODEM, less, edit
 ├── storage/                 хранилище: таблица разделов, своя ФС BFS, VFS
 ├── tools/                   serial-read, xsend, fsdump, flash-backup, check-image, smoke, reset
 ├── test/                    хостовые тесты (Unity)

@@ -92,6 +92,9 @@ elseif(BASALT_APP_SHELL)
         "../shell/parse.c"
         "../shell/redirect.c"
         "../shell/xmodem.c"
+        "../shell/hexdump.c"
+        "../shell/pager.c"
+        "../shell/editor.c"
         "../shell/history.c"
         "../shell/lineedit.c"
     )

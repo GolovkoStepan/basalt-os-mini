@@ -24,12 +24,15 @@
 #include "bfs_flash.h"
 #include "button.h"
 #include "console_usb_jtag.h"
+#include "editor.h"
 #include "esp_heap_caps.h"
 #include "format.h"
+#include "hexdump.h"
 #include "history.h"
 #include "lcd.h"
 #include "lineedit.h"
 #include "matrix.h"
+#include "pager.h"
 #include "parse.h"
 #include "redirect.h"
 #include "stack.h"
@@ -1477,6 +1480,868 @@ static void cmd_rz(int argc, char** argv)
     out_diag(" мс\n");
 }
 
+// --- hexdump: файл байтами ---------------------------------------------------
+//
+// Читает файл кусками по строке дампа и печатает через out_puts, поэтому
+// работает и с `>`, и с `|`: `hexdump /etc/rc | less` - обычное дело.
+//
+// Без аргумента читает stdin, как `cat`: иначе `hexdump < /etc/rc` и
+// `hexdump /etc/rc | less` разошлись бы по смыслу, хотя оба читают один файл.
+//
+// Смещение считается по всему файлу, а не по куску: иначе на каждой новой
+// строке чтения адрес начинался бы с нуля, и по дампу нельзя было бы понять,
+// где что лежит.
+static void cmd_hexdump(int argc, char** argv)
+{
+    const bool from_stdin = (argc < 2);
+    if (from_stdin && !stdin_ready()) {
+        out_diag("hexdump <файл>\n");
+        return;
+    }
+
+    int fd = -1;
+    if (!from_stdin) {
+        const int rc = vfs_open(argv[1], VFS_O_RDONLY, &fd);
+        if (rc != VFS_OK) {
+            out_path_error(rc);
+            return;
+        }
+    }
+
+    uint8_t chunk[HEXDUMP_BYTES];
+    char line[HEXDUMP_LINE_MAX];
+    uint32_t offset = 0;
+    int rc = VFS_OK;
+
+    // Конец файла - это ноль прочитанных байт, а не «прочитали меньше, чем
+    // просили»: короткое чтение внутри файла возможно у другой ФС, и обрывать
+    // на нём дамп значило бы молча показать половину файла.
+    for (;;) {
+        uint32_t got = 0;
+        rc = from_stdin ? stdin_read(chunk, sizeof(chunk), &got)
+                        : vfs_read(fd, chunk, sizeof(chunk), &got);
+        if (rc != VFS_OK || got == 0) {
+            break;
+        }
+
+        // Буфер строки ровно того размера, который требует hexdump_line,
+        // поэтому здесь она нуля не вернёт (ноль - это отказ, а не пустая
+        // строка).
+        hexdump_line(line, sizeof(line), offset, chunk, got);
+        out_puts(line);
+        offset += got;
+    }
+
+    if (!from_stdin) {
+        vfs_close(fd);
+    }
+
+    if (rc != VFS_OK) {
+        out_path_error(rc);
+    }
+}
+
+// --- less: постраничный просмотр --------------------------------------------
+//
+// Вторая команда, которая владеет консолью и экраном (первая - `rz`): пока она
+// работает, главный цикл стоит в run_command и байты в редактор не попадают.
+// Иначе пробел, нажатый для листания, оказался бы в строке приглашения.
+//
+// Разметка страницы живёт в shell/pager.c и проверена на маке: здесь остаются
+// только клавиши, экран и переходы по потоку.
+//
+// Экран после выхода очищается: страница файла не должна остаться висеть под
+// приглашением, иначе следующая команда печатается поверх чужого текста.
+// Приглашение и остальную картинку шелла рисует уже вызывающий.
+
+static uint16_t s_less_cells[PAGER_ROWS][PAGER_COLS];
+
+// Страница и экран - одно и то же, и расхождение видно не как ошибка сборки, а
+// как «последняя строка страницы уехала под состояние». Проверяем числом, а не
+// комментарием: смена геометрии матрицы должна ломать сборку, а не `less`.
+_Static_assert(PAGER_COLS == TEXT_COLS && PAGER_ROWS == TEXT_ROWS - 1,
+               "страница less обязана совпадать с экраном без строки состояния");
+
+// Смещения показанных страниц для кнопки «назад», кольцом. Кольцо, а не
+// растущий список: листать назад глубже 256 страниц не станут, а запись
+// страницы `cur - 1` перезаписывается только через 256 страниц вперёд, то есть
+// уже после того, как от неё ушли. Растущий список на 14 МБ файла - это 8700
+// смещений по 4 байта, и он упёрся бы в память ради того, чего никто не делает.
+#define LESS_HISTORY 256u
+static uint32_t s_less_starts[LESS_HISTORY];
+
+typedef struct {
+    int fd;          // -1 - источник stdin (конвейер или `< файл`)
+    bool seekable;   // можно ли вернуться на предыдущую страницу
+} less_src;
+
+// Чтение источника. Имя файла открыто дескриптором, stdin - общим путём
+// (конвейер в памяти или `s_in_fd` после `<`), чтобы не заводить второй
+// разбор того же случая.
+static int less_read(void* ctx, uint8_t* dst, uint32_t cap, uint32_t* got)
+{
+    less_src* const src = ctx;
+    if (src->fd >= 0) {
+        return vfs_read(src->fd, dst, cap, got);
+    }
+    return stdin_read(dst, cap, got);
+}
+
+static int less_seek(void* ctx, uint32_t offset)
+{
+    less_src* const src = ctx;
+    if (!src->seekable || src->fd < 0) {
+        return -1;
+    }
+    return vfs_seek(src->fd, offset);
+}
+
+// Клавиша с ожиданием. Возвращает байт нажатия как есть: разбирать его -
+// дело команды, а не ожидания. Так читают обе полноэкранные команды - `less`
+// и `edit`.
+//
+// flush - выбросить то, что уже накопилось, и только потом ждать. Это нужно
+// один раз, на входе в полноэкранный режим: после Enter и эха команды в буфере
+// остаётся перевод строки, и он прокрутил бы страницу без нажатия. Дальше
+// выбрасывать нельзя: в редакторе накопившиеся байты - это набранные буквы, и
+// «защита от застрявшего Enter» съедала бы их по восемь за нажатие.
+static int console_key_ex(bool flush)
+{
+    uint8_t b = 0;
+
+    if (flush) {
+        for (int i = 0; i < 8; ++i) {
+            if (basalt_console_read(&b, 1) == 0) {
+                break;
+            }
+            basalt_delay_us(1000);
+        }
+    }
+
+    for (;;) {
+        if (basalt_console_read(&b, 1) > 0) {
+            return b;
+        }
+
+        // Кнопка G0 - Ctrl-C: терминал на маке иногда держит прерывание у
+        // себя, а на плате кнопка есть всегда. Байт именно 0x03, а не буква
+        // `q`: редактор считает `q` обычным символом, и кнопка вставила бы её
+        // в текст.
+        if (button_down(BUTTON_PRIMARY)) {
+            basalt_delay_us(30000);
+            if (button_down(BUTTON_PRIMARY)) {
+                return 0x03;
+            }
+        }
+        basalt_delay_us(2000);
+    }
+}
+
+// Обычное чтение для полноэкранных команд: накопленный хвост ввода не нужен.
+static int console_key(void)
+{
+    return console_key_ex(true);
+}
+
+// Нарисовать страницу и строку состояния под ней. Курсор убираем: подчёркивание
+// посреди файла читается как ещё один символ.
+//
+// can_back - у источника есть seek. От этого зависит подсказка: обещать `b`
+// там, где назад нельзя, значит показать клавишу, которая выбросит из просмотра.
+static void less_draw(const pager_page* page, bool can_back)
+{
+    text_clear();
+
+    for (int r = 0; r < page->rows && r < PAGER_ROWS; ++r) {
+        text_cursor_at(0, r);
+        for (int c = 0; c < PAGER_COLS; ++c) {
+            const uint16_t cp = s_less_cells[r][c];
+            if (cp == 0) {
+                break;
+            }
+            screen_put_cp(cp);
+        }
+    }
+
+    // Строка состояния - в последней строке экрана. Без неё не видно ни того,
+    // что файл длиннее страницы, ни того, что дальше уже конец.
+    text_cursor_at(0, TEXT_ROWS - 1);
+    if (page->eof) {
+        text_puts(can_back ? "конец файла  b - назад, q - выход"
+                           : "конец файла  q - выход");
+    } else {
+        text_puts(can_back ? "пробел/Enter - дальше, b - назад, q - выход"
+                           : "пробел/Enter - дальше, q - выход");
+    }
+
+    // В USB-поток страница уходит построчно, как обычный вывод, а не как экран:
+    // экрана в терминале мака нет, а текст есть - и прочитать файл в `pio
+    // device monitor` так же естественно, как в `cat`. Стирать прошлую
+    // страницу при этом нечем, и она остаётся в прокрутке - это цена за то,
+    // что поток остаётся потоком.
+    if (s_mirror) {
+        char buf[4];
+        for (int r = 0; r < page->rows && r < PAGER_ROWS; ++r) {
+            for (int c = 0; c < PAGER_COLS; ++c) {
+                const uint16_t cp = s_less_cells[r][c];
+                if (cp == 0) {
+                    break;
+                }
+                basalt_console_write(buf, utf8_encode(cp, buf));
+            }
+            mirror_str("\r\n");
+        }
+        mirror_str(page->eof ? "\r\n-- конец --\r\n" : "\r\n-- дальше --\r\n");
+    }
+
+    text_cursor_blink(false);
+    present_dirty();
+}
+
+static void cmd_less(int argc, char** argv)
+{
+    // Как у rz: перенаправление вывода означало бы «страница ушла в файл».
+    if (s_sink != SINK_SCREEN) {
+        out_diag("less: перенаправление вывода не поддерживается\n");
+        return;
+    }
+    if (argc < 2 && !stdin_ready()) {
+        out_diag("less <файл>\n");
+        return;
+    }
+
+    less_src src;
+    memset(&src, 0, sizeof(src));
+    src.fd = -1;
+
+    // Источник: имя файла либо stdin (`< файл` и конвейер). Назад можно только
+    // у файла: у конвейера нет ни дескриптора, ни смещения.
+    bool own_fd = false;
+    if (argc >= 2) {
+        const int rc = vfs_open(argv[1], VFS_O_RDONLY, &src.fd);
+        if (rc != VFS_OK) {
+            out_path_error(rc);
+            return;
+        }
+        src.seekable = true;
+        own_fd = true;
+    } else if (s_in_fd >= 0) {
+        src.fd = s_in_fd;
+        src.seekable = true;
+    }
+
+    pager pg;
+    pager_io io;
+    io.ctx = &src;
+    io.read = less_read;
+    io.seek = less_seek;
+    pager_init(&pg, io);
+
+    // Смещение страницы, которую надо показать. Единственный источник истины:
+    // «назад» и «вперёд» меняют только его, а чтение каждый раз начинается с
+    // него же. Иначе после возврата на первую страницу поток оставался бы на
+    // второй, и следующая страница показала бы текст не с того места.
+    uint32_t want = 0;
+    uint32_t cur = 0;  // номер показанной страницы, для кольца смещений
+
+    // Чем кончился просмотр, если кончился ошибкой. Печатать сразу нельзя:
+    // на выходе экран чистится, и сообщение исчезло бы вместе с ним - на плате
+    // от него не осталось бы даже следа.
+    const char* fault = NULL;
+    int fault_rc = VFS_OK;
+
+    for (;;) {
+        // seek на каждой странице, а не только при возврате: он стоит одну
+        // установку смещения в VFS, а раздвоенный путь «сейчас я после
+        // прокрутки» / «сейчас я после возврата» уже один раз показал не ту
+        // страницу.
+        if (src.seekable && pager_seek(&pg, want) != 0) {
+            fault = "less: поток не прокручивается";
+            break;
+        }
+
+        const pager_page page = pager_fill(&pg, s_less_cells);
+
+        if (pg.error != VFS_OK) {
+            fault_rc = pg.error;
+            break;
+        }
+
+        less_draw(&page, src.seekable && cur > 0);
+
+        // Смещение текущей страницы записывается и на последней: иначе с конца
+        // файла нельзя было бы вернуться назад, а «конец» - не повод терять
+        // место, где читатель остановился.
+        s_less_starts[cur % LESS_HISTORY] = want;
+
+        int key;
+        if (page.eof) {
+            // «Конец» не должен исчезать сам: последние строки читают глазами.
+            // И уйти с него назад тоже должно быть можно - файл не кончился
+            // там, где перестал влезать на экран. А если назад некуда (одна
+            // страница) или нечем (конвейер), `b` просто не значит ничего:
+            // выбрасывать читателя с последней строки из-за лишнего нажатия
+            // незачем.
+            const bool can_back = src.seekable && cur > 0;
+            do {
+                key = console_key();
+            } while (key != 'q' && key != 0x03 && !(key == 'b' && can_back));
+        } else {
+            key = console_key();
+        }
+
+        if (key == 'q' || key == 0x03) {
+            break;
+        }
+
+        if (key == 'b') {
+            // Возврат на первую страницу - это повторное чтение её же с
+            // начала, а не «остаться где стоим»: поток уже ушёл вперёд.
+            if (!src.seekable) {
+                // У конвейера смещений нет: перечитать предыдущую страницу
+                // нечем, а показать следующую под видом предыдущей - соврать.
+                fault = "less: назад нельзя, поток не прокручивается";
+                break;
+            }
+            if (cur > 0) {
+                --cur;
+                want = s_less_starts[cur % LESS_HISTORY];
+            }
+            continue;
+        }
+
+        // На конце файла вперёд некуда: искать страницу за концом значило бы
+        // показать пустую и потребовать ещё одно нажатие.
+        if (page.eof) {
+            continue;
+        }
+
+        // Пробел, Enter и всё остальное - вперёд. У обычного `less` пробел
+        // листает страницу, Enter - строку; здесь страница, и это сказано в
+        // строке состояния.
+        want = page.next;
+        ++cur;
+    }
+
+    if (own_fd) {
+        vfs_close(src.fd);
+    }
+
+    text_clear();
+
+    // Сообщение - после очистки, уже поверх приглашения: экран больше не наш.
+    if (fault_rc != VFS_OK) {
+        out_path_error(fault_rc);
+    } else if (fault != NULL) {
+        out_diag(fault);
+        out_diag("\n");
+    }
+}
+
+// --- edit: полноэкранный редактор -------------------------------------------
+//
+// Третья команда, которая владеет консолью и экраном (после `rz` и `less`):
+// клавиши читает сама, поэтому перенаправление для неё - ошибка, а не режим.
+//
+// Текст, курсор и клавиши живут в shell/editor.c и проверены на маке: здесь
+// остаются файл, экран, сохранение и строка состояния.
+//
+// На маке включается альтернативный экран (CSI ?1049), чтобы после выхода
+// вернулся прежний текст терминала; на плате матрица просто чистится. Строки
+// перерисовываются только изменившиеся: полная перерисовка на каждое нажатие -
+// это 16 полос по 6 КБ через SPI.
+
+// 64 КБ - предел на файл. Редактор держит текст целиком, а не листает файл:
+// вставка в середину требует сдвига хвоста, и без буфера пришлось бы
+// переписывать файл на каждую букву. Для файлов с мака этого хватает, а
+// больше - это уже про другой редактор.
+#define EDIT_BUF_SIZE (64u * 1024u)
+
+static uint16_t s_edit_cells[EDITOR_ROWS][EDITOR_COLS];
+
+// Что было на экране в прошлый раз. Сравнение с ним и есть «перерисовать
+// только изменившиеся строки»; флагов изменённости матрицы для этого мало -
+// она помечает строку при каждой записи, даже если текст тот же.
+static uint16_t s_edit_prev[EDITOR_ROWS][EDITOR_COLS];
+
+// Строка состояния и сообщения о сохранении. Статикой, а не на стеке: текст
+// рисуется на следующей итерации, когда локальная переменная уже мертва.
+static char s_edit_msg[96];
+
+_Static_assert(EDITOR_COLS == TEXT_COLS && EDITOR_ROWS == TEXT_ROWS - 1,
+               "окно редактора обязано совпадать с экраном без строки состояния");
+
+static size_t str_app(char* out, size_t cap, size_t at, const char* s)
+{
+    while (*s != '\0' && at + 1 < cap) {
+        out[at++] = *s++;
+    }
+    out[at] = '\0';
+    return at;
+}
+
+// Сколько байт строки влезает в max_cells клеток.
+static size_t cells_prefix_len(const char* s, int max_cells)
+{
+    utf8_decoder dec;
+    utf8_reset(&dec);
+
+    int cells = 0;
+    size_t at = 0;
+    while (s[at] != '\0' && cells < max_cells) {
+        uint32_t cp = 0;
+        const utf8_status st = utf8_feed(&dec, (uint8_t)s[at], &cp);
+        ++at;
+        if (st != UTF8_PENDING) {
+            ++cells;  // и настоящий символ, и '?' на месте битого - клетка
+        }
+    }
+    return at;
+}
+
+// Вывести не больше max_cells клеток. Возвращает, сколько вывел: по этому
+// числу ставится курсор в строке ввода.
+static int put_cells(const char* s, int max_cells)
+{
+    utf8_decoder dec;
+    utf8_reset(&dec);
+
+    int cells = 0;
+    for (const char* p = s; *p != '\0' && cells < max_cells; ++p) {
+        uint32_t cp = 0;
+        const utf8_status st = utf8_feed(&dec, (uint8_t)*p, &cp);
+        if (st == UTF8_PENDING) {
+            continue;
+        }
+        if (st == UTF8_INVALID) {
+            cp = '?';
+        }
+        screen_put_cp(cp);
+        ++cells;
+    }
+    return cells;
+}
+
+// То же, но с добивкой пробелами до конца строки. Добивать обязательно: строка
+// состояния меняется от длинной подсказки к короткому сообщению, и в USB хвост
+// стирает ESC[K, а в матрице стирать некому - старый текст остался бы висеть
+// справа. Возвращается число клеток текста, а не добивки.
+static int put_cells_pad(const char* s, int max_cells)
+{
+    const int cells = put_cells(s, max_cells);
+    for (int c = cells; c < max_cells; ++c) {
+        screen_put_cp(' ');
+    }
+    return cells;
+}
+
+// Поставить курсор терминала мака в строку и колонку. Настоящий терминал
+// умеет это сам, поэтому в USB уходят байты позиционирования, а не полная
+// картинка: на 115200 полный экран - это треть секунды на каждое нажатие.
+static void mirror_at(int row, int col)
+{
+    if (!s_mirror) {
+        return;
+    }
+    char num[21];
+    mirror_str("\x1b[");
+    mirror_str(basalt_format_u64(num, sizeof(num), (uint64_t)row + 1));
+    mirror_str(";");
+    mirror_str(basalt_format_u64(num, sizeof(num), (uint64_t)col + 1));
+    mirror_str("H");
+}
+
+static void mirror_cells(const uint16_t* cells, int n)
+{
+    if (!s_mirror) {
+        return;
+    }
+    char buf[4];
+    for (int c = 0; c < n; ++c) {
+        const size_t k = utf8_encode(cells[c], buf);
+        if (k > 0) {
+            basalt_console_write(buf, k);
+        }
+    }
+    mirror_str("\x1b[K");
+}
+
+// Строка состояния: имя, позиция курсора, признак правок и сообщение.
+static void edit_status_line(char* out, size_t cap, const editor* ed, const char* name,
+                             const char* msg)
+{
+    uint32_t line = 0;
+    uint32_t col = 0;
+    ed_line_col(ed, &line, &col);
+
+    char num[21];
+    size_t at = 0;
+    at = str_app(out, cap, at, name);
+    at = str_app(out, cap, at, "  ");
+    at = str_app(out, cap, at, basalt_format_u64(num, sizeof(num), line));
+    at = str_app(out, cap, at, ":");
+    at = str_app(out, cap, at, basalt_format_u64(num, sizeof(num), col));
+    if (ed_dirty(ed)) {
+        // Звёздочка, как в vim: несохранённое должно быть видно, не открывая
+        // заново меню.
+        at = str_app(out, cap, at, " *");
+    }
+    if (msg != NULL && msg[0] != '\0') {
+        at = str_app(out, cap, at, "  ");
+        (void)str_app(out, cap, at, msg);
+    }
+}
+
+static void edit_draw(const editor* ed, const char* name, const char* msg, bool force)
+{
+    for (int r = 0; r < EDITOR_ROWS; ++r) {
+        const int n = ed_row(ed, r, s_edit_cells[r], EDITOR_COLS);
+        for (int c = n; c < EDITOR_COLS; ++c) {
+            s_edit_cells[r][c] = ' ';
+        }
+
+        if (!force && memcmp(s_edit_cells[r], s_edit_prev[r], sizeof(s_edit_cells[r])) == 0) {
+            continue;
+        }
+        memcpy(s_edit_prev[r], s_edit_cells[r], sizeof(s_edit_cells[r]));
+
+        text_cursor_at(0, r);
+        for (int c = 0; c < EDITOR_COLS; ++c) {
+            screen_put_cp(s_edit_cells[r][c]);
+        }
+
+        mirror_at(r, 0);
+        mirror_cells(s_edit_cells[r], EDITOR_COLS);
+    }
+
+    char line[TEXT_COLS * 4];
+    edit_status_line(line, sizeof(line), ed, name, msg);
+
+    // Не больше TEXT_COLS - 1 клеток: 53-я вызвала бы перевод строки, а на
+    // последней строке экрана это прокрутка всего экрана - редактор «поехал»
+    // бы вверх на каждое нажатие.
+    text_cursor_at(0, TEXT_ROWS - 1);
+    (void)put_cells_pad(line, TEXT_COLS - 1);
+
+    if (s_mirror) {
+        mirror_at(TEXT_ROWS - 1, 0);
+        basalt_console_write(line, cells_prefix_len(line, TEXT_COLS - 1));
+        mirror_str("\x1b[K");
+    }
+
+    int row = 0;
+    int col = 0;
+    ed_cursor_screen(ed, &row, &col);
+    text_cursor_at(col, row);
+    text_cursor_blink(true);
+
+    // Курсор терминала - в его же координатах, а не в матричных: строк
+    // состояния на маке нет, а экран редактора начинается с первой строки.
+    mirror_at(row, col);
+    present_dirty();
+}
+
+// Имя временного файла рядом с целевым. BFS_NAME_MAX = 24, поэтому длинное
+// имя с суффиксом не влезет - тогда в том же каталоге берётся .edit.tmp.
+// Потерять безопасность записи из-за длины имени хуже редкой коллизии:
+// редактор один, второй записи в тот же каталог одновременно не будет.
+static bool edit_temp_path(const char* path, char* out, size_t cap)
+{
+    const char* const slash = strrchr(path, '/');
+    const size_t dir = (slash == NULL) ? 0 : (size_t)(slash - path) + 1;
+    const char* const leaf = (slash == NULL) ? path : slash + 1;
+
+    const bool fits = (strlen(leaf) + 4 <= BFS_NAME_MAX);
+    const char* const suffix = fits ? ".tmp" : ".edit.tmp";
+    const size_t keep = fits ? strlen(leaf) : 0;
+
+    const size_t total = dir + keep + strlen(suffix);
+    if (total + 1 > cap) {
+        return false;
+    }
+    memcpy(out, path, dir + keep);
+    strcpy(out + dir + keep, suffix);
+    return true;
+}
+
+// Записать текст и заменить им файл. Атомарной замены в BFS нет: rename
+// отказывает, если цель существует. Порядок поэтому такой: сначала целиком
+// пишется .tmp, и только потом старый файл удаляется и .tmp переименовывается.
+// Сбой посреди записи оставит целый старый файл и мусорный .tmp; сбой между
+// удалением и переименованием - только .tmp, и он целый.
+static int edit_save(const char* path, const char* data, uint32_t len, char* tmp, size_t tmp_cap)
+{
+    if (!edit_temp_path(path, tmp, tmp_cap)) {
+        return VFS_ERR_NAME;
+    }
+
+    int fd = -1;
+    int rc = vfs_open(tmp, VFS_O_WRONLY | VFS_O_CREATE | VFS_O_TRUNC, &fd);
+    if (rc != VFS_OK) {
+        return rc;
+    }
+
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t put = 0;
+        rc = vfs_write(fd, data + done, len - done, &put);
+        if (rc != VFS_OK || put == 0) {
+            break;
+        }
+        done += put;
+    }
+    vfs_close(fd);
+
+    if (rc != VFS_OK) {
+        vfs_unlink(tmp);
+        return rc;
+    }
+
+    rc = vfs_unlink(path);
+    if (rc != VFS_OK && rc != VFS_ERR_NOT_FOUND) {
+        vfs_unlink(tmp);
+        return rc;
+    }
+
+    return vfs_rename(tmp, path);
+}
+
+// Строка поиска рисуется в той же строке состояния. Отдельный мини-редактор
+// ради одного поля - лишний код: нужны набор, Backspace и Enter.
+static void edit_ask_draw(const char* prompt, const char* text)
+{
+    char line[TEXT_COLS * 4];
+    const size_t at = str_app(line, sizeof(line), 0, prompt);
+    (void)str_app(line, sizeof(line), at, text);
+
+    text_cursor_at(0, TEXT_ROWS - 1);
+    const int cells = put_cells_pad(line, TEXT_COLS - 1);
+
+    if (s_mirror) {
+        mirror_at(TEXT_ROWS - 1, 0);
+        basalt_console_write(line, cells_prefix_len(line, TEXT_COLS - 1));
+        mirror_str("\x1b[K");
+        mirror_at(TEXT_ROWS - 1, cells);
+    }
+
+    text_cursor_at(cells < TEXT_COLS ? cells : TEXT_COLS - 1, TEXT_ROWS - 1);
+    text_cursor_blink(true);
+    present_dirty();
+}
+
+// true - строка введена, false - отменено (Ctrl-C, Ctrl-Q, ESC).
+static bool edit_ask(const char* prompt, char* out, size_t cap)
+{
+    size_t len = 0;
+    out[0] = '\0';
+
+    utf8_decoder dec;
+    utf8_reset(&dec);
+
+    // Хвост ввода от команды выбрасываем один раз, на первом нажатии: дальше
+    // это уже набранные буквы.
+    bool first = true;
+    for (;;) {
+        edit_ask_draw(prompt, out);
+
+        const int key = console_key_ex(first);
+        first = false;
+        if (key == 0x03 || key == 0x11 || key == 0x1B) {
+            return false;
+        }
+        if (key == '\r' || key == '\n') {
+            return true;
+        }
+        if (key == 0x7F || key == 0x08) {
+            // Откатываем целый символ, а не байт: «Ж» - два байта.
+            while (len > 0 && ((uint8_t)out[len - 1] & 0xC0u) == 0x80u) {
+                --len;
+            }
+            if (len > 0) {
+                --len;
+            }
+            out[len] = '\0';
+            utf8_reset(&dec);
+            continue;
+        }
+        if (key < 0x20) {
+            continue;
+        }
+
+        uint32_t cp = 0;
+        if (utf8_feed(&dec, (uint8_t)key, &cp) != UTF8_DONE) {
+            continue;
+        }
+        char enc[4];
+        const size_t n = utf8_encode(cp, enc);
+        if (n > 0 && len + n + 1 <= cap) {
+            memcpy(out + len, enc, n);
+            len += n;
+            out[len] = '\0';
+        }
+    }
+}
+
+static void cmd_edit(int argc, char** argv)
+{
+    // Как у rz и less: перенаправление вывода означало бы «экран ушёл в файл».
+    if (s_sink != SINK_SCREEN) {
+        out_diag("edit: перенаправление вывода не поддерживается\n");
+        return;
+    }
+    if (argc < 2) {
+        out_diag("edit <файл>\n");
+        return;
+    }
+
+    // Текст - в PSRAM: это буфер под данные, а не горячий код. Если PSRAM на
+    // плате нет, годится и обычная память, как у конвейера.
+    char* buf = heap_caps_malloc(EDIT_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        buf = heap_caps_malloc(EDIT_BUF_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (buf == NULL) {
+        out_diag("edit: нет памяти под буфер\n");
+        return;
+    }
+
+    editor ed;
+    ed_init(&ed, buf, EDIT_BUF_SIZE);
+
+    // Нет файла - это новый файл, а не ошибка: `edit notes.txt` должен
+    // открывать пустой буфер, иначе набрать первый текст было бы нечем.
+    uint32_t len = 0;
+    bool truncated = false;
+    int fd = -1;
+    int read_rc = VFS_OK;
+
+    const int open_rc = vfs_open(argv[1], VFS_O_RDONLY, &fd);
+    if (open_rc == VFS_OK) {
+        for (;;) {
+            uint32_t got = 0;
+            read_rc = vfs_read(fd, buf + len, EDIT_BUF_SIZE - len, &got);
+            if (read_rc != VFS_OK || got == 0) {
+                break;
+            }
+            len += got;
+
+            if (len == EDIT_BUF_SIZE) {
+                // Ровно 64 КБ тоже бывает: проверяем, есть ли за ними ещё.
+                uint8_t extra = 0;
+                uint32_t more = 0;
+                truncated = (vfs_read(fd, &extra, 1, &more) == VFS_OK && more > 0);
+                break;
+            }
+        }
+        vfs_close(fd);
+    } else if (open_rc != VFS_ERR_NOT_FOUND) {
+        out_path_error(open_rc);
+        heap_caps_free(buf);
+        return;
+    }
+
+    if (read_rc != VFS_OK) {
+        out_path_error(read_rc);
+        heap_caps_free(buf);
+        return;
+    }
+
+    ed_load(&ed, len);
+
+    if (s_mirror) {
+        mirror_str("\x1b[?1049h");
+        mirror_str("\x1b[H\x1b[2J");
+    }
+
+    text_clear();
+    memset(s_edit_prev, 0, sizeof(s_edit_prev));
+
+    str_app(s_edit_msg, sizeof(s_edit_msg), 0,
+            truncated ? "файл больше 64 КБ - читаю начало, сохранить нельзя"
+                      : "Ctrl-S сохранить, Ctrl-F найти, Ctrl-Q выход");
+
+    const char* msg = s_edit_msg;
+    bool force = true;
+    bool first = true;
+
+    for (;;) {
+        edit_draw(&ed, argv[1], msg, force);
+        force = false;
+        msg = NULL;
+
+        // Хвост ввода от команды - только на первом нажатии: дальше каждый
+        // байт в буфере это буква, которую человек уже набрал.
+        const int key = console_key_ex(first);
+        first = false;
+        const ed_event ev = ed_input(&ed, (uint8_t)key);
+
+        if (ev == ED_QUIT) {
+            break;
+        }
+
+        switch (ev) {
+        case ED_SAVE: {
+            // Файл прочитан не целиком: запись затёрла бы хвост, который в
+            // буфер не влез. Молча терять данные нельзя, а «сохранить первые
+            // 64 КБ» - это не сохранение.
+            if (truncated) {
+                str_app(s_edit_msg, sizeof(s_edit_msg), 0,
+                        "файл больше 64 КБ - сохранить нельзя");
+                msg = s_edit_msg;
+                break;
+            }
+
+            char tmp[VFS_PATH_MAX];
+            const int save_rc = edit_save(argv[1], ed_data(&ed), ed_len(&ed), tmp, sizeof(tmp));
+            if (save_rc == VFS_OK) {
+                ed_mark_saved(&ed);
+
+                char num[21];
+                size_t at = str_app(s_edit_msg, sizeof(s_edit_msg), 0, "сохранено, ");
+                at = str_app(s_edit_msg, sizeof(s_edit_msg), at,
+                             basalt_format_u64(num, sizeof(num), ed_len(&ed)));
+                (void)str_app(s_edit_msg, sizeof(s_edit_msg), at, " Б");
+            } else {
+                // Причина - в строке состояния: напечатанное до очистки экрана
+                // на плате не видно, и «не сохранилось» выглядело бы как
+                // потерянный файл.
+                const size_t at = str_app(s_edit_msg, sizeof(s_edit_msg), 0, "не сохранено: ");
+                (void)str_app(s_edit_msg, sizeof(s_edit_msg), at, vfs_strerror(save_rc));
+            }
+            msg = s_edit_msg;
+            break;
+        }
+
+        case ED_QUIT_DIRTY:
+            str_app(s_edit_msg, sizeof(s_edit_msg), 0, "есть правки: Ctrl-Q ещё раз - выйти");
+            msg = s_edit_msg;
+            break;
+
+        case ED_FIND: {
+            char needle[64];
+            if (edit_ask("поиск: ", needle, sizeof(needle)) && needle[0] != '\0') {
+                if (ed_search(&ed, needle) != 0) {
+                    str_app(s_edit_msg, sizeof(s_edit_msg), 0, "не найдено");
+                    msg = s_edit_msg;
+                }
+            }
+            break;
+        }
+
+        default:
+            break;
+        }
+    }
+
+    if (s_mirror) {
+        mirror_str("\x1b[?1049l");
+    }
+
+    text_clear();
+    text_cursor_blink(true);
+    heap_caps_free(buf);
+}
+
 static const command s_commands[] = {
     {"help",    cmd_help,    "этот список"},
     {"echo",    cmd_echo,    "напечатать аргументы"},
@@ -1492,6 +2357,9 @@ static const command s_commands[] = {
     {"crash",   cmd_crash,   "проверить панику"},
     {"ls",      cmd_ls,      "каталог: имена и размеры"},
     {"cat",     cmd_cat,     "показать файл"},
+    {"hexdump", cmd_hexdump, "файл байтами: смещение, hex, ASCII"},
+    {"less",    cmd_less,    "постранично: пробел, b, q"},
+    {"edit",    cmd_edit,    "полноэкранный редактор"},
     {"cd",      cmd_cd,      "сменить каталог"},
     {"pwd",     cmd_pwd,     "текущий каталог"},
     {"stat",    cmd_stat,    "тип и размер"},
