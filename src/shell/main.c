@@ -43,6 +43,7 @@
 #include "tick.h"
 #include "int1.h"
 #include "idle.h"
+#include "tasks.h"
 #include "tty.h"
 #include "utf8.h"
 #include "vectors.h"
@@ -73,6 +74,10 @@ static bool s_halt;
 // поэтому объявления стоят здесь, а определения - ниже, в блоке времени.
 static bool shell_now(uint32_t* out);
 static int fs_save_clock(uint32_t unix_secs);
+
+// Счётчик итераций демо-задачи. Объявление здесь по той же причине: cmd_top
+// стоит выше определения задачи.
+uint32_t shell_task_iterations(void);
 
 // --- вывод: экран и USB ---------------------------------------------------
 
@@ -359,6 +364,22 @@ static void out_u64_2(uint64_t v)
     out_u64(v);
 }
 
+// Hex с фиксированным числом знаков. Нужен именно отдельной функцией, а не
+// «out_u64 после 0x»: однажды PS уже напечатали десятичным после «0x», и
+// 0x395042 в логе прочитали как PS с WOE=0, хотя настоящий PS был 0x60722.
+// Ошибка чтения стоила правки в ассемблере, которой там быть не должно было.
+static void out_hex(uint32_t v, int digits)
+{
+    char buf[9];
+    static const char kDigits[] = "0123456789abcdef";
+    for (int i = digits - 1; i >= 0; --i) {
+        buf[i] = kDigits[v & 0xFu];
+        v >>= 4;
+    }
+    buf[digits] = '\0';
+    out_puts(buf);
+}
+
 // Кибибайты. Байты в отчёте о памяти ничего не говорят, а перевод в КБ -
 // одна операция, которая не ошибается.
 static void out_kib(size_t bytes)
@@ -573,24 +594,82 @@ static void cmd_free(int argc, char** argv)
 // Остаток стека - не украшение. На xtensa переполнение стека не даёт внятной
 // ошибки: оно молча затирает соседние данные. Поэтому число берётся из
 // закраски (arch/xtensa/stack.c) и показывает самый глубокий момент.
+static const char* task_state_text(basalt_task_state_t st)
+{
+    switch (st) {
+    case BASALT_TASK_RUNNING:
+        return "выполняется";
+    case BASALT_TASK_READY:
+        return "готова";
+    case BASALT_TASK_DONE:
+        return "завершена";
+    default:
+        return "свободна";
+    }
+}
+
 static void cmd_top(int argc, char** argv)
 {
     (void)argc;
     (void)argv;
 
-    const size_t used = basalt_stack_used();
-    const size_t size = basalt_stack_size();
+    const size_t count = basalt_task_count();
+    out_puts("задач ");
+    out_u64(count);
+    out_puts("\n");
 
-    out_puts("задач 1\n");
-    out_puts("  главная   выполняется   стек ");
-    out_u64(used);
-    out_puts("/");
-    out_u64(size);
-    out_puts(" Б (");
-    out_percent(used, size);
-    out_puts("), остаток ");
-    out_u64(size - used);
-    out_puts(" Б\n");
+    for (size_t i = 0; i < count; ++i) {
+        basalt_task_info_t info;
+        if (!basalt_task_get(i, &info)) {
+            continue;
+        }
+
+        // Отметка текущей задачи: по ней видно, кто именно держит процессор в
+        // момент вызова top, а не «какая-то из них».
+        out_puts(i == basalt_task_current() ? "  * " : "    ");
+        out_puts(info.name);
+
+        // Выравнивание пробелами, а не табуляцией: матрица понимает табуляцию
+        // по-своему, а колонки должны сходиться на экране платы.
+        size_t pad = strlen(info.name) + 2;
+        do {
+            out_puts(" ");
+            ++pad;
+        } while (pad < 11);
+
+        out_puts(task_state_text(info.state));
+
+        // У главной задачи стека в планировщике нет: его задал start.S, и
+        // размер знает только stack.c. Показываем тем же способом, что и
+        // раньше, - иначе строка главной задачи стала бы пустой.
+        if (info.stack_size == 0) {
+            const size_t used = basalt_stack_used();
+            const size_t size = basalt_stack_size();
+            out_puts("   стек ");
+            out_u64(used);
+            out_puts("/");
+            out_u64(size);
+            out_puts(" Б (");
+            out_percent(used, size);
+            out_puts(")");
+        } else {
+            out_puts("   стек ");
+            out_u64(info.stack_used);
+            out_puts("/");
+            out_u64(info.stack_size);
+            out_puts(" Б (");
+            out_percent(info.stack_used, info.stack_size);
+            out_puts(")");
+        }
+
+        out_puts(", смен ");
+        out_u64(info.switches);
+        out_puts("\n");
+    }
+
+    out_puts("переключений ");
+    out_u64(basalt_task_switches());
+    out_puts("\n");
 
     out_puts("uptime ");
     out_u64(basalt_uptime_us() / 1000000u);
@@ -606,6 +685,13 @@ static void cmd_top(int argc, char** argv)
     out_puts("сон ");
     out_u64(basalt_idle_waits());
     out_puts(" раз\n");
+
+    // Итерации демо-задачи: если это число не растёт между двумя вызовами
+    // top, планировщик не переключает, и всё остальное в отчёте - украшение.
+    out_puts("пульс ");
+    out_u64(shell_task_iterations());
+    out_puts(" итераций\n");
+
     out_puts("SRAM свободно ");
     out_kib(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     out_puts(", PSRAM свободно ");
@@ -792,11 +878,11 @@ static void cmd_tickrate(int argc, char** argv)
     basalt_int1_state_view_t v;
     basalt_int1_view(&v);
     out_puts("  INTENABLE 0x");
-    out_u64(v.intenable);
+    out_hex(v.intenable, 8);
     out_puts(" INTERRUPT 0x");
-    out_u64(v.interrupt);
+    out_hex(v.interrupt, 8);
     out_puts(" PS 0x");
-    out_u64(v.ps);
+    out_hex(v.ps, 8);
     out_puts("\n  CCOUNT ");
     out_u64(v.ccount);
     out_puts(" CCOMPARE0 ");
@@ -3116,6 +3202,40 @@ static void poll_button(void)
     }
 }
 
+// --- задачи (веха A6, шаг 2) ----------------------------------------------
+//
+// Демонстрационная задача. Существует не «чтобы было», а чтобы переключение
+// контекста было видно на плате, а не только в коде: она считает итерации и
+// отдаёт процессор, а `top` показывает, что работа шла.
+//
+// Почему счётчик, а не печать в консоль. Печать из задачи конфликтовала бы с
+// шеллом: оба пишут в одну матрицу и один USB. Счётчик же доказывает главное -
+// задача действительно выполнялась, пока шелл ждал ввода.
+static volatile uint32_t s_task_iterations;
+
+static void demo_task(void* arg)
+{
+    (void)arg;
+
+    for (;;) {
+        // Работа задачи: считаем итерации. Именно это число должно расти в
+        // `top`, пока шелл стоит на приглашении.
+        s_task_iterations += 1;
+
+        // Отдаём процессор. Без этой строки задача не уступила бы никогда, и
+        // шелл перестал бы отвечать: кооперативная система держится на том,
+        // что каждая задача сама уступает.
+        basalt_task_yield();
+    }
+}
+
+// Сколько итераций сделала демо-задача. Для `top`: если число не растёт,
+// планировщик не работает, и остальные его показатели ничего не значат.
+uint32_t shell_task_iterations(void)
+{
+    return s_task_iterations;
+}
+
 // --- старт ----------------------------------------------------------------
 
 void basalt_main(void)
@@ -3183,6 +3303,10 @@ void basalt_main(void)
     // потому что разбудить его было бы некому.
     basalt_idle_init();
 
+    // Планировщик - после тика и сна: до этого задача, отдавшая процессор,
+    // разбудить себя не смогла бы. Главный поток становится задачей 0.
+    basalt_task_init("главная");
+
     basalt_put("[shell] тик ");
     basalt_put_u64(BASALT_INT1_HZ);
     basalt_put(" Гц, ядро ");
@@ -3190,6 +3314,21 @@ void basalt_main(void)
     basalt_put(" МГц\n");
 
     basalt_put("ready\n\n");
+
+    // Демо-задача заводится после ready: до этой строки порт на маке может
+    // быть ещё не открыт, и всё, что она напечатала бы, ушло бы в никуда.
+    //
+    // Стек 4 КБ при BASALT_TASK_MAX=4: четыре задачи - это 16 КБ внутренней
+    // памяти, которая у нас не бесконечна (см. top).
+    const basalt_task_config_t demo = {
+        .name = "пульс",
+        .fn = demo_task,
+        .arg = NULL,
+        .stack_size = 0,  // BASALT_TASK_STACK_SIZE
+    };
+    if (!basalt_task_create(&demo)) {
+        basalt_put("[shell] задача не создана: нет памяти\n");
+    }
 
     prompt();
 
@@ -3226,6 +3365,13 @@ void basalt_main(void)
         }
 
         present_dirty();
+
+        // Отдаём процессор, если есть кому. Возвращённое true означает, что
+        // переключение состоялось и кто-то поработал: тогда спать нельзя -
+        // иначе отданная задача получит управление только через тик.
+        if (basalt_task_yield()) {
+            continue;
+        }
 
         // Спим до ближайшего тика, а не крутимся на basalt_delay_us(500).
         //
