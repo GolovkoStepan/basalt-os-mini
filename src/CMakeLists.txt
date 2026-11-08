@@ -156,6 +156,7 @@ idf_component_register(
         "../arch/xtensa/idle.c"
         "../arch/xtensa/tasks.c"
         "../arch/xtensa/tasks.S"
+        "../arch/xtensa/sched.c"
         ${BASALT_INDICATOR_SRC}
         "../arch/xtensa/format.c"
         "../arch/xtensa/panic.c"

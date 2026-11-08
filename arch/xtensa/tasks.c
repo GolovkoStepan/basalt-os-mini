@@ -29,6 +29,10 @@
 
 #include "esp_heap_caps.h"
 
+#include "idle.h"
+#include "sched.h"
+#include "tick.h"
+
 // Контекст переключения. Раскладка продублирована в tasks.S (CTX_*) и
 // сверяется _Static_assert ниже: разъедутся - получим запись не туда, и это
 // на плате выглядит как молчащая плата, а не как ошибка сборки.
@@ -55,6 +59,10 @@ typedef struct {
     uint8_t* stack;       // низ выделенного блока (его и освобождаем)
     size_t stack_size;
     uint32_t switches;
+    uint64_t wake_at;     // спящая: uptime в мкс, когда проснуться
+    uint64_t cpu_us;      // суммарное время на процессоре, мкс
+    uint64_t cpu_us_at_sample;  // cpu_us на прошлом замере
+    uint8_t cpu_percent;  // доля процессора с прошлого замера
 } task_t;
 
 static task_t s_tasks[BASALT_TASK_MAX];
@@ -62,6 +70,19 @@ static size_t s_count;      // сколько слотов занято (вкл�
 static size_t s_current;
 static bool s_inited;
 static uint32_t s_switches;
+
+// Учёт времени: сколько накопилось на каждой задаче и сколько система спала.
+//
+// Почему по времени, а не по числу переключений. Счётчик `switches` говорит,
+// как часто задачу выбирали, но не сколько она работала: главная за одну
+// итерацию читает USB, рисует экран и опрашивает кнопки, а демо-задача делает
+// одну операцию - при равенстве переключений проценты вышли бы 50/50, и это
+// выглядело бы как ошибка учёта. Время же есть время: при переключении
+// накопленное отдаётся той задаче, которая только что работала.
+static uint64_t s_now_us;    // момент последней смены задачи
+static uint64_t s_idle_us;   // сколько система проспала в waiti
+static uint64_t s_idle_us_at_sample;
+static uint8_t s_idle_percent;  // доля сна за последний интервал
 
 // Метка закраски стека задачи. Своя, а не из stack.c: у главной задачи стек
 // закрашивает stack.c, и повторная закраска тем же значением не отличила бы
@@ -93,6 +114,7 @@ uint32_t s_task_ps;
 
 // Переключение. Единственная ассемблерная функция; см. tasks.S.
 void basalt_task_switch(uint32_t* save_sp, switch_ctx_t* load);
+
 
 // Переходник между переключателем и функцией задачи: зовёт её и закрывает
 // задачу после возврата. Лежит в tasks.S рядом с переключателем, чтобы первый
@@ -138,6 +160,10 @@ void basalt_task_init(const char* name)
     // память.
     s_tasks[0].stack = NULL;
     s_tasks[0].stack_size = 0;
+
+    // Точка отсчёта времени задач. Ноль означал бы, что первая же смена
+    // приписала главной всё время с запуска счётчика (секунды паузы в старте).
+    s_now_us = basalt_uptime_us();
 
     s_inited = true;
 
@@ -231,15 +257,23 @@ bool basalt_task_create(const basalt_task_config_t* cfg)
 
 // Выбрать следующую готовую задачу, начиная с from+1, по кругу. Возвращает
 // индекс или SIZE_MAX, если готовых больше нет.
+//
+// Сам обход живёт в sched.c: это чистая логика, и на маке её проверяет
+// test_sched. Здесь только сборка состояний в массив - раскладка task_t нам
+// принадлежит, а sched.c про неё знать не должен.
+static size_t state_snapshot(basalt_task_state_t* out)
+{
+    for (size_t i = 0; i < s_count; ++i) {
+        out[i] = s_tasks[i].state;
+    }
+    return s_count;
+}
+
 static size_t next_ready(size_t from)
 {
-    for (size_t i = 1; i <= s_count; ++i) {
-        const size_t k = (from + i) % s_count;
-        if (s_tasks[k].state == BASALT_TASK_READY || s_tasks[k].state == BASALT_TASK_RUNNING) {
-            return k;
-        }
-    }
-    return (size_t)-1;
+    basalt_task_state_t states[BASALT_TASK_MAX];
+    const size_t n = state_snapshot(states);
+    return sched_pick(states, n, from);
 }
 
 static void switch_to(size_t next)
@@ -256,6 +290,13 @@ static void switch_to(size_t next)
     nxt->state = BASALT_TASK_RUNNING;
     nxt->switches += 1;
     s_switches += 1;
+
+    // Время на процессоре отдаём тому, кто работал до переключения. Читаем
+    // uptime здесь, а не после - иначе в `cur` записалась бы и наша собственная
+    // работа по переключению.
+    const uint64_t now = basalt_uptime_us();
+    cur->cpu_us += now - s_now_us;
+    s_now_us = now;
 
     const size_t prev = s_current;
     s_current = next;
@@ -274,6 +315,18 @@ bool basalt_task_yield(void)
         return false;
     }
 
+    // Пробуждение по сроку - здесь, а не в главном цикле и не в обработчике
+    // тика. Выбор задачи и есть тот момент, когда «кто-то готов» пересчитывается
+    // заново; в главном цикле это было бы привязано к одному вызывающему
+    // (задача, которая спит внутри basalt_task_sleep_ms, его не проходит), а в
+    // обработчике тика - потребовало бы вызова C-функции из прерывания, чего
+    // обработчик не делает.
+    //
+    // Цена: обход таблицы (не больше BASALT_TASK_MAX) на каждое переключение.
+    // Замерено около 150 тысяч переключений в секунду, то есть сотни тысяч
+    // сравнений - на 160 МГц это ничто.
+    (void)basalt_task_wake_due();
+
     const size_t next = next_ready(s_current);
     if (next == (size_t)-1 || next == s_current) {
         return false;
@@ -282,49 +335,233 @@ bool basalt_task_yield(void)
     return true;
 }
 
-// Сколько задач готовы выполняться. Нужно basalt_task_exit: уходить с
-// последней нельзя.
-static size_t ready_count(void)
+// Сколько задач готовы выполняться. Ноль значит «все спят»: только тогда
+// уместен сон системы, иначе готовую задачу никто не выберет.
+size_t basalt_task_ready_count(void)
 {
-    size_t n = 0;
-    for (size_t i = 0; i < s_count; ++i) {
-        if (s_tasks[i].state == BASALT_TASK_READY || s_tasks[i].state == BASALT_TASK_RUNNING) {
-            ++n;
+    basalt_task_state_t states[BASALT_TASK_MAX];
+    const size_t n = state_snapshot(states);
+    size_t ready = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (states[i] == BASALT_TASK_READY || states[i] == BASALT_TASK_RUNNING) {
+            ++ready;
         }
     }
-    return n;
+    return ready;
+}
+
+void basalt_task_sleep_ms(uint32_t ms)
+{
+    if (!s_inited) {
+        // Планировщика нет: единственный способ подождать - занять ядро.
+        // Так бывает только в env'ах без shell, и лучше явная задержка, чем
+        // молчаливое «сон не работает».
+        basalt_idle_ms(ms);
+        return;
+    }
+
+    if (ms == 0) {
+        // «До следующего тика»: уступаем, если есть кому, и спим, если нет.
+        if (!basalt_task_yield()) {
+            basalt_task_wait();
+        }
+        return;
+    }
+
+    s_tasks[s_current].wake_at = basalt_uptime_us() + (uint64_t)ms * 1000u;
+
+    // Состояние меняется ДО переключения, иначе задача снова попала бы в выбор
+    // на следующем же yield: switch_to переводит в READY только RUNNING.
+    s_tasks[s_current].state = BASALT_TASK_BLOCKED;
+
+    // Ждём возврата. Пробуждение делает basalt_task_yield: он выбирает
+    // следующую задачу, а значит именно он пересчитывает «кто готов». Если
+    // готовых нет, спим всей системой - иначе ожидание превратилось бы в
+    // холостой цикл, в котором некому разбудить даже себя.
+    for (;;) {
+        // Состояние проверяем до уступки: срок мог наступить, пока мы тут
+        // стояли. После уступки проверять не нужно - yield уже разбудил
+        // просроченных, и если нас выбрали, мы больше не BLOCKED.
+        if (s_tasks[s_current].state != BASALT_TASK_BLOCKED) {
+            return;
+        }
+        (void)basalt_task_wake_due();
+        if (s_tasks[s_current].state != BASALT_TASK_BLOCKED) {
+            return;
+        }
+        if (!basalt_task_yield()) {
+            basalt_task_wait();
+        }
+    }
+}
+
+void basalt_task_wait(void)
+{
+    if (!s_inited) {
+        basalt_idle_wait();
+        return;
+    }
+
+    // Разбудить тех, чей срок наступил, и только потом спать. Порядок важен:
+    // если спать первым, разбудившее нас прерывание вернёт управление уже
+    // после проверки, и просроченная задача простояла бы лишний тик.
+    (void)basalt_task_wake_due();
+
+    // Сон системы тоже идёт в счёт интервала: без него `top` показывал бы
+    // 100 % занятости у задач, даже когда система почти всё время спит.
+    const uint64_t before = basalt_uptime_us();
+
+    // `waiti` возвращается на любом прерывании, а тик идёт 100 раз в секунду,
+    // поэтому условие перепроверяется вызывающим, а не здесь. Спать «ровно до
+    // срока» бессмысленно: ближайший тик всё равно наступит раньше 10 мс.
+    basalt_idle_wait();
+
+    const uint64_t after = basalt_uptime_us();
+    s_idle_us += after - before;
+
+    // Время сна не принадлежит ни одной задаче: сдвигаем точку отсчёта, иначе
+    // следующая смена приписала бы его той задаче, что работала до сна.
+    s_now_us = after;
 }
 
 void basalt_task_exit(void)
 {
-    s_tasks[s_current].state = BASALT_TASK_DONE;
+    task_t* cur = &s_tasks[s_current];
+    cur->state = BASALT_TASK_DONE;
+
+    // Сон задачи, которая завершилась, больше не срок: иначе пробуждение
+    // перевело бы DONE в READY, и yield выбрал бы задачу, чей кадр на стеке
+    // уже мёртв.
+    cur->wake_at = 0;
 
     // Стек не освобождаем сразу: мы на нём стоим. Освободит тот, кто приберёт
     // слот, - в basalt_task_create. Освобождать из переключателя нельзя: там
     // не вызовешь ни одной функции C.
-    if (ready_count() == 0) {
-        // Стоять молча нельзя: плата просто замолчит, и это неотличимо от
-        // зависшего USB-JTAG. Но и паника не годится - у неё нет кадра, и она
-        // напечатала бы мусор вместо адреса. Оставляем системе шанс сказать
-        // об этом самой: ждём прерываний, чтобы шелл мог напечатать строку.
-        //
-        // На практике сюда не попадают: главная задача не завершается.
-        for (;;) {
-            __asm__ volatile("waiti 2");
-        }
-    }
-
-    const size_t next = next_ready(s_current);
-    if (next == (size_t)-1) {
-        for (;;) {
-            __asm__ volatile("waiti 2");
-        }
+    //
+    // Выбирать следующего приходится в цикле, а не одним заходом. С шага 3
+    // задача может СПАТЬ, и «готовых нет» больше не значит «в системе больше
+    // никого»: остальные спят и ждут срока. Если просто уйти в waiti, разбудить
+    // их будет некому - wake_due зовут выполняющиеся задачи, а выполняющихся
+    // не осталось. На плате это выглядело бы как молчащая плата ровно после
+    // того, как задача с `sleep` вернулась.
+    //
+    // Стоять молча тоже нельзя: плата замолчит, и это неотличимо от зависшего
+    // USB-JTAG. Но и паника не годится - у неё нет кадра, и она напечатала бы
+    // мусор вместо адреса.
+    size_t next = next_ready(s_current);
+    while (next == (size_t)-1) {
+        // basalt_task_wait, а не ручной wake_due + idle_wait: он же учитывает
+        // время сна в статистике. Иначе простой здесь записался бы в cpu_us
+        // завершившейся задачи и всплыл бы в `top` у того, кого уже нет.
+        basalt_task_wait();
+        next = next_ready(s_current);
     }
 
     switch_to(next);
     // Сюда не возвращаемся: задачу больше не выберут.
     for (;;) {
     }
+}
+
+uint64_t basalt_task_next_wake(void)
+{
+    // Сроки лежат в структуре задачи, а sched.c про неё не знает: поэтому
+    // собираем два параллельных массива. Размер - по константе, а не по
+    // s_count: массив на стеке, и лишние слоты ничего не стоят.
+    basalt_task_state_t states[BASALT_TASK_MAX];
+    uint64_t wake_at[BASALT_TASK_MAX];
+    for (size_t i = 0; i < s_count; ++i) {
+        states[i] = s_tasks[i].state;
+        wake_at[i] = s_tasks[i].wake_at;
+    }
+    return sched_next_wake(states, wake_at, s_count);
+}
+
+size_t basalt_task_wake_due(void)
+{
+    basalt_task_state_t states[BASALT_TASK_MAX];
+    uint64_t wake_at[BASALT_TASK_MAX];
+    for (size_t i = 0; i < s_count; ++i) {
+        states[i] = s_tasks[i].state;
+        wake_at[i] = s_tasks[i].wake_at;
+    }
+
+    const size_t woken = sched_wake_due(states, wake_at, s_count, basalt_uptime_us());
+    if (woken == 0) {
+        return 0;
+    }
+
+    // Обратная запись: какие именно задачи разбудили, sched_wake_due не
+    // сообщает - ей достаточно числа. Сверяем по изменившемуся состоянию, а
+    // не по сроку: срок мог остаться тем же, а решение «проснулась» - уже
+    // принятым.
+    for (size_t i = 0; i < s_count; ++i) {
+        if (s_tasks[i].state == BASALT_TASK_BLOCKED && states[i] == BASALT_TASK_READY) {
+            s_tasks[i].state = BASALT_TASK_READY;
+            s_tasks[i].wake_at = 0;
+        }
+    }
+    return woken;
+}
+
+void basalt_task_cpu_sample(void)
+{
+    // Сначала закрываем текущий интервал: время с прошлой смены принадлежит
+    // той задаче, которая работает прямо сейчас. Без этого она потеряла бы
+    // последний кусок, и сумма долей не сходилась бы с интервалом.
+    const uint64_t now = basalt_uptime_us();
+    s_tasks[s_current].cpu_us += now - s_now_us;
+    s_now_us = now;
+
+    // Разницы считаем в массив ДО обновления снимка. Если обновить счётчики в
+    // первом же проходе и считать доли во втором, второй проход увидит нули, и
+    // проценты всегда были бы нулевыми - ошибка тихая, `top` просто показывал
+    // бы 0 % у всех.
+    uint64_t delta[BASALT_TASK_MAX];
+    uint64_t total = 0;
+    for (size_t i = 0; i < s_count; ++i) {
+        delta[i] = s_tasks[i].cpu_us - s_tasks[i].cpu_us_at_sample;
+        s_tasks[i].cpu_us_at_sample = s_tasks[i].cpu_us;
+        total += delta[i];
+    }
+
+    // Сон системы - тоже часть интервала, и в долях задач он не участвует.
+    // Без него сумма процентов всегда была бы 100, и было бы не видно, что
+    // система в простое почти всё время спит.
+    const uint64_t idle = s_idle_us - s_idle_us_at_sample;
+    s_idle_us_at_sample = s_idle_us;
+    total += idle;
+
+    if (total == 0) {
+        // Делить не на что. Проценты прошлого интервала не обнуляем: ноль
+        // выглядел бы как «всё встало», хотя это значило бы «интервал пуст».
+        return;
+    }
+
+    // Доли считаются с округлением вниз: остаток уходит сну, потому что он
+    // появился именно из-за waiti. Поэтому сумма «задачи + сон» на экране
+    // всегда ровно 100, и разбираться с недобором не приходится.
+    uint32_t given = 0;
+
+    for (size_t i = 0; i < s_count; ++i) {
+        s_tasks[i].cpu_percent = 0;
+    }
+
+    for (size_t i = 0; i < s_count; ++i) {
+        if (delta[i] == 0) {
+            continue;
+        }
+        const uint32_t share = (uint32_t)((delta[i] * 100u) / total);
+        s_tasks[i].cpu_percent = (uint8_t)(share > 100u ? 100u : share);
+        given += s_tasks[i].cpu_percent;
+    }
+
+    s_idle_percent = (uint8_t)(given < 100u ? 100u - given : 0u);
+}
+
+uint8_t basalt_task_idle_percent(void)
+{
+    return s_idle_percent;
 }
 
 uint32_t basalt_task_switches(void)
@@ -350,6 +587,17 @@ bool basalt_task_get(size_t index, basalt_task_info_t* out)
     // планировщика нет. Отчёт для неё заполняет вызывающий - см. cmd_top.
     out->stack_used = t->stack ? stack_used(t) : 0;
     out->switches = t->switches;
+    out->cpu_percent = t->cpu_percent;
+
+    // Сколько ещё ждать. Считаем от текущего времени, а не храним: остаток
+    // меняется сам, и запоминать его пришлось бы обновлять на каждом тике.
+    out->wake_in_ms = 0;
+    if (t->state == BASALT_TASK_BLOCKED && t->wake_at != 0) {
+        const uint64_t now = basalt_uptime_us();
+        if (t->wake_at > now) {
+            out->wake_in_ms = (uint32_t)((t->wake_at - now + 999u) / 1000u);
+        }
+    }
     return true;
 }
 
