@@ -688,8 +688,14 @@ static void cmd_top(int argc, char** argv)
         out_puts("\n");
     }
 
+    // Вытеснений отдельно от смен: смена по yield и смена по тику - разные
+    // вещи, и если второе число ноль при работающих задачах, вытеснение не
+    // работает вовсе (тогда sum смен растёт только из-за уступок, и задача,
+    // зацикленная без yield, повесила бы систему).
     out_puts("переключений ");
     out_u64(basalt_task_switches());
+    out_puts(", из них по тику ");
+    out_u64(basalt_task_preempts());
     out_puts(", сон ");
     out_u64(basalt_task_idle_percent());
     out_puts("%\n");

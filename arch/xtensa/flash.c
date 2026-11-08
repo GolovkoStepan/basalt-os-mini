@@ -6,6 +6,8 @@
 #include "esp_flash.h"
 #include "esp_private/esp_flash_internal.h"
 
+#include "int1.h"
+
 // Состояние в статике, а не в структуре у вызывающего: flash на плате один, и
 // второй экземпляр драйвера означал бы два независимых представления о том,
 // что уже стёрто. Пока это так, интерфейс может быть без аргумента-дескриптора.
@@ -79,6 +81,46 @@ uint32_t basalt_flash_id(void)
     return s_id;
 }
 
+// Общая обвязка трёх операций: погасить тик, сделать дело, вернуть тик.
+//
+// Почему на всех трёх, а не только на стирании и записи. Драйвер гасит кэш и на
+// чтении тоже (esp_flash_read тоже идёт через no-OS обвязку), а обработчику тика
+// при погашенном кэше нельзя ни выбирать задачу, ни даже вернуться в C. Дешевле
+// погасить линию и на чтении, чем помнить, какие из операций «безопасные».
+//
+// Отдельная функция, а не три копии пары: забыть release в одной из веток -
+// типичная ошибка, и она выглядит как «тик пропал», то есть совсем не там, где
+// искать.
+static int with_int_off(int (*op)(void* ctx), void* ctx)
+{
+    basalt_int1_hold();
+    const int err = op(ctx);
+    basalt_int1_release();
+    return err;
+}
+
+typedef struct {
+    uint32_t address;
+    void* buf;
+    uint32_t length;
+    bool write;
+} flash_op_t;
+
+static int flash_op(void* ctx)
+{
+    flash_op_t* const op = (flash_op_t*)ctx;
+    if (op->write) {
+        return esp_flash_write(esp_flash_default_chip, op->buf, op->address, op->length);
+    }
+    return esp_flash_read(esp_flash_default_chip, op->buf, op->address, op->length);
+}
+
+static int erase_op(void* ctx)
+{
+    const uint32_t address = *(const uint32_t*)ctx;
+    return esp_flash_erase_region(esp_flash_default_chip, address, BASALT_FLASH_SECTOR_SIZE);
+}
+
 int basalt_flash_read(uint32_t address, void* dst, size_t length)
 {
     if (!s_ready) {
@@ -87,7 +129,8 @@ int basalt_flash_read(uint32_t address, void* dst, size_t length)
     if (dst == NULL || length == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    return esp_flash_read(esp_flash_default_chip, dst, address, (uint32_t)length);
+    flash_op_t op = {address, dst, (uint32_t)length, false};
+    return with_int_off(flash_op, &op);
 }
 
 int basalt_flash_erase_sector(uint32_t address)
@@ -101,7 +144,7 @@ int basalt_flash_erase_sector(uint32_t address)
     if ((address % BASALT_FLASH_SECTOR_SIZE) != 0u) {
         return ESP_ERR_INVALID_ARG;
     }
-    return esp_flash_erase_region(esp_flash_default_chip, address, BASALT_FLASH_SECTOR_SIZE);
+    return with_int_off(erase_op, &address);
 }
 
 int basalt_flash_write(uint32_t address, const void* src, size_t length)
@@ -115,5 +158,6 @@ int basalt_flash_write(uint32_t address, const void* src, size_t length)
     // Стирание не делаем намеренно: «записать» и «стереть и записать» - разные
     // операции, и вторая не должна случаться от опечатки в адресе. Кто хочет
     // заменить содержимое, тот и стирает.
-    return esp_flash_write(esp_flash_default_chip, src, address, (uint32_t)length);
+    flash_op_t op = {address, (void*)src, (uint32_t)length, true};
+    return with_int_off(flash_op, &op);
 }

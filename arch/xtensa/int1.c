@@ -126,3 +126,42 @@ void basalt_int1_view(basalt_int1_state_view_t* out)
     __asm__ volatile("rsr %0, ccount" : "=r"(out->ccount));
     __asm__ volatile("rsr %0, ccompare1" : "=r"(out->ccompare));
 }
+
+// Счётчик вложенности маски. Держится отдельно от маски, чтобы hold/release
+// можно было звать парой из разных мест и не думать о том, кто первый: маска
+// восстанавливается только на нуле, поэтому вложенный вызов внутри операции с
+// flash не включит линию раньше времени.
+static uint32_t s_hold_depth;
+
+void basalt_int1_hold(void)
+{
+    if (s_hold_depth++ != 0) {
+        return;
+    }
+
+    // Линия гасится чтением-или-записью INTENABLE, а не через `rsil`: rsil
+    // работает с INTLEVEL и на время записи во flash погасил бы все прерывания
+    // ниже уровня, а не одну нашу линию. Нужно ровно одно: чтобы тик не пришёл,
+    // пока кэш выключен и обработчик не может исполняться из flash.
+    uint32_t intenable = 0;
+    __asm__ volatile("rsr %0, intenable" : "=r"(intenable));
+    __asm__ volatile("wsr %0, intenable\n\t"
+                     "rsync" ::"r"(intenable & ~(1u << BASALT_INT_LINE))
+                     : "memory");
+}
+
+void basalt_int1_release(void)
+{
+    if (s_hold_depth == 0) {
+        return;
+    }
+    if (--s_hold_depth != 0) {
+        return;
+    }
+
+    uint32_t intenable = 0;
+    __asm__ volatile("rsr %0, intenable" : "=r"(intenable));
+    __asm__ volatile("wsr %0, intenable\n\t"
+                     "rsync" ::"r"(intenable | (1u << BASALT_INT_LINE))
+                     : "memory");
+}
