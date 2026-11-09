@@ -283,6 +283,22 @@ void basalt_panic_exc(basalt_frame_t* frame)
     basalt_put_hex(interrupt, 8);
     basalt_put("\n");
 
+    // Окна: без этих двух чисел разбор паники в слоте переполнения окон
+    // сводится к догадкам. WINDOWBASE говорит, какое окно физически видно,
+    // WINDOWSTART - какие окна аппаратура считает живыми; обработчик
+    // WindowOverflow ищет по маске кадр предка, и если окно, чьи регистры мы
+    // только что загрузили, в маске не отмечено, он возьмёт «указатель стека»
+    // из регистра, который им никогда не был.
+    uint32_t windowbase = 0;
+    uint32_t windowstart = 0;
+    __asm__ volatile("rsr %0, windowbase" : "=r"(windowbase));
+    __asm__ volatile("rsr %0, windowstart" : "=r"(windowstart));
+    basalt_put("WINDOWBASE ");
+    basalt_put_u64(windowbase & 0xFu);
+    basalt_put("  WINDOWSTART 0x");
+    basalt_put_hex(windowstart, 8);
+    basalt_put("\n");
+
     // Регистры парами: столбиком это 16 строк, а читать их всё равно
     // осмысленно только рядом друг с другом.
     const uint32_t regs[16] = {

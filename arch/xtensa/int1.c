@@ -7,6 +7,8 @@
 
 #include "sdkconfig.h"
 
+#include "tick.h"
+
 // Линия прерывания и порог PS.INTLEVEL, на который настроен обработчик.
 //
 // Линия 15 - это CCOMPARE1 по конфигурации чипа (XCHAL_TIMER1_INTERRUPT), а её
@@ -33,14 +35,17 @@
 // раскладки от расхождения: ошибка выглядит на плате как «тики не растут»,
 // без единого сообщения сборки.
 typedef struct {
-    volatile uint32_t ticks;   // 0: сколько тиков прошло
-    uint32_t period;           // 4: период в тактах ядра
+    volatile uint32_t ticks;    // 0: сколько НАСТОЯЩИХ тиков прошло
+    uint32_t period;            // 4: период в тактах ядра
+    volatile uint32_t deadline; // 8: CCOUNT, когда должен наступить следующий тик
 } basalt_int1_state_t;
 
 _Static_assert(__builtin_offsetof(basalt_int1_state_t, ticks) == 0,
                "состояние тика: ticks");
 _Static_assert(__builtin_offsetof(basalt_int1_state_t, period) == 4,
                "состояние тика: period");
+_Static_assert(__builtin_offsetof(basalt_int1_state_t, deadline) == 8,
+               "состояние тика: deadline");
 
 basalt_int1_state_t basalt_int1_state;
 
@@ -58,17 +63,31 @@ static uint32_t period_cycles(void)
 
 void basalt_int1_init(void)
 {
-    basalt_int1_state.ticks = 0;
+    // Счётчик тиков начинается не с нуля, а с числа периодов, прошедших с
+    // запуска системного счётчика.
+    //
+    // Иначе `top` показывает противоречие: время идёт с `basalt_tick_init`
+    // (самое начало старта), а тики - только с этого вызова, который стоит
+    // после двухсекундной паузы для хоста. На плате это выглядело как
+    // «uptime 3 с, тиков 55 (100 Гц)» - оба числа верны, но вместе читаются
+    // как ошибка.
+    //
+    // Так счётчик означает то, что написано: сколько периодов по 10 мс прошло
+    // с запуска. Не все из них прерывали процессор - во время паузы тика ещё
+    // не было, - но время текло, и счётчик времени обязан это учитывать.
+    basalt_int1_state.ticks =
+        (uint32_t)(basalt_tick_cycles() * BASALT_INT1_HZ / BASALT_TICK_HZ);
     basalt_int1_state.period = period_cycles();
 
     // Первое срабатывание - через период от текущего значения. Без этой записи
-    // CCOMPARE1 равен нулю, а CCOUNT давно ушёл вперёд: условие «CCOUNT >=
-    // COMPARE» выполнено постоянно, и прерывание превратилось бы в шторм с
-    // первого же такта.
+    // CCOMPARE1 равен нулю, а CCOUNT давно ушёл вперёд: запись в прошлое на
+    // Xtensa не даёт прерывания вообще (таймер срабатывает на равенстве), и
+    // тик не пришёл бы никогда.
     uint32_t ccount = 0;
     __asm__ volatile("rsr %0, ccount" : "=r"(ccount));
+    basalt_int1_state.deadline = ccount + basalt_int1_state.period;
     __asm__ volatile("wsr %0, ccompare1\n\t"
-                     "esync" ::"r"(ccount + basalt_int1_state.period)
+                     "esync" ::"r"(basalt_int1_state.deadline)
                      : "memory");
 
     // Разрешить линию 15 в контроллере прерываний ядра.
@@ -163,5 +182,45 @@ void basalt_int1_release(void)
     __asm__ volatile("rsr %0, intenable" : "=r"(intenable));
     __asm__ volatile("wsr %0, intenable\n\t"
                      "rsync" ::"r"(intenable | (1u << BASALT_INT_LINE))
+                     : "memory");
+}
+
+void basalt_int1_trigger(void)
+{
+    // Заказ тика: «приди сейчас». Периодический срок при этом НЕ трогается.
+    //
+    // CCOMPARE1 ставится чуть вперёд, а не назад: на Xtensa таймер срабатывает
+    // на РАВЕНСТВЕ CCOUNT и CCOMPARE, поэтому запись в прошлое не даёт
+    // прерывания вообще. Здесь была ошибка, которая стоила часа: писалось
+    // `ccount - 1`, заказ не срабатывал, и тик шёл только когда запись случайно
+    // попадала точно в счётчик - на плате это выглядело как «из них по тику 1»
+    // и замерший счётчик.
+    //
+    // Запас (64 такта, 400 нс на 160 МГц) нужен потому, что между чтением CCOUNT
+    // и записью проходит десяток инструкций: значение должно быть ещё в будущем.
+    //
+    // Периодический срок (`deadline`) остаётся в `basalt_int1_state`: обработчик
+    // вернёт на него CCOMPARE1, распознав заказ по «CCOUNT ещё не дошёл до
+    // срока». Иначе заказы, которых бывает тысячи в секунду, перекрывали бы
+    // настоящий тик 100 Гц и счётчик тиков стоял бы на месте.
+    //
+    // Если до срока осталось меньше, чем `soon`, ставим срок - но только если
+    // он ещё в будущем. Просроченный срок ставить нельзя: запись в прошлое не
+    // даёт прерывания вообще (таймер срабатывает на равенстве), и заказ
+    // потеряется. Просроченный срок обработает ближайший заказ: обработчик
+    // увидит «CCOUNT >= deadline» и засчитает настоящий тик.
+    const uint32_t soon = 64;
+    uint32_t ccount = 0;
+    __asm__ volatile("rsr %0, ccount" : "=r"(ccount));
+
+    uint32_t when = ccount + soon;
+    const int32_t before_deadline = (int32_t)(basalt_int1_state.deadline - ccount);
+    const int32_t before_soon = (int32_t)(basalt_int1_state.deadline - when);
+    if (before_deadline > 0 && before_soon < 0) {
+        when = basalt_int1_state.deadline;
+    }
+
+    __asm__ volatile("wsr %0, ccompare1\n\t"
+                     "esync" ::"r"(when)
                      : "memory");
 }

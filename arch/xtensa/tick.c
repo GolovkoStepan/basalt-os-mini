@@ -19,6 +19,27 @@ void basalt_tick_init(void)
 
 uint64_t basalt_tick_cycles(void)
 {
+    // Последовательность защёлкивания делается НЕДЕЛИМОЙ.
+    //
+    // Здесь был дефект, вылезший только с вытеснением. UPDATE - это защёлка по
+    // фронту: SET запускает снимок, CLEAR снимает запрос, и без CLEAR следующий
+    // SET не сработает - на плате это выглядело как застывшее время (`uptime`
+    // не растёт, `sleep` возвращается мгновенно).
+    //
+    // Но с CLEAR последовательность нельзя прерывать. Пока задача между SET и
+    // CLEAR, приходит тик, обработчик зовёт `basalt_task_preempt`, а тот зовёт
+    // `basalt_uptime_us` - ту же функцию поверх самой себя. Вложенный вызов
+    // защёлкивает и снимает запрос, внешний остаётся ждать VALUE_VALID, которого
+    // уже не будет, и читает мусор. При 100 Гц окно было микроскопическим и
+    // дефект не ловился; с заказом тика из `yield` прерываний стало около
+    // пятнадцати тысяч в секунду, и он вылез сразу.
+    //
+    // Поэтому на время четырёх обращений к регистрам прерывания закрываются.
+    // Это дёшево (несколько тактов), а из обработчика тика вызов безопасен
+    // вдвойне: там INTLEVEL и так равен 3, и rsil ничего не меняет.
+    uint32_t ps = 0;
+    __asm__ volatile("rsil %0, 3" : "=r"(ps) : : "memory");
+
     SET_PERI_REG_MASK(SYSTIMER_UNIT0_OP_REG, SYSTIMER_TIMER_UNIT0_UPDATE);
     CLEAR_PERI_REG_MASK(SYSTIMER_UNIT0_OP_REG, SYSTIMER_TIMER_UNIT0_UPDATE);
 
@@ -34,6 +55,11 @@ uint64_t basalt_tick_cycles(void)
 
     const uint64_t hi = READ_PERI_REG(SYSTIMER_UNIT0_VALUE_HI_REG);
     const uint64_t lo = READ_PERI_REG(SYSTIMER_UNIT0_VALUE_LO_REG);
+
+    __asm__ volatile("wsr %0, ps\n\t"
+                     "rsync" ::"r"(ps)
+                     : "memory");
+
     return (hi << 32) | lo;
 }
 
